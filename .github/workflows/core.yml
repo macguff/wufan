@@ -21,8 +21,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $dll = (Resolve-Path 'target/x86_64-pc-windows-msvc/release/ime_windows_tsf.dll').Path
-          & "$env:WINDIR/System32/regsvr32.exe" /s $dll
-          if ($LASTEXITCODE -ne 0) { throw "TSF registration failed: $LASTEXITCODE" }
+          $register = Start-Process -FilePath "$env:WINDIR/System32/regsvr32.exe" -ArgumentList @('/s', "`"$dll`"") -Wait -PassThru
+          if ($register.ExitCode -ne 0) { throw "TSF registration failed: $($register.ExitCode)" }
           try {
             $key = 'Registry::HKEY_CURRENT_USER\Software\Classes\CLSID\{58F68769-239A-4DCA-854E-57AA887E979B}\InprocServer32'
             $registered = (Get-Item -LiteralPath $key).GetValue('')
@@ -33,8 +33,8 @@ jobs:
             if ($null -eq $instance) { throw 'COM activation returned null' }
             [void][Runtime.InteropServices.Marshal]::ReleaseComObject($instance)
           } finally {
-            & "$env:WINDIR/System32/regsvr32.exe" /s /u $dll
-            if ($LASTEXITCODE -ne 0) { throw "TSF unregistration failed: $LASTEXITCODE" }
+            $unregister = Start-Process -FilePath "$env:WINDIR/System32/regsvr32.exe" -ArgumentList @('/s', '/u', "`"$dll`"") -Wait -PassThru
+            if ($unregister.ExitCode -ne 0) { throw "TSF unregistration failed: $($unregister.ExitCode)" }
           }
       - uses: actions/upload-artifact@v4
         if: always()
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: -C instrument-coverage
-      LLVM_PROFILE_FILE: coverage/%p-%m.profraw
+      LLVM_PROFILE_FILE: ${{ github.workspace }}/coverage/%p-%m.profraw
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

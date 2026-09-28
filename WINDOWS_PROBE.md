@@ -10,8 +10,8 @@ Use a Windows 10/11 x64 machine with Visual Studio 2022 C++ build tools, Windows
 .\build.ps1 ci
 cargo build --locked -p ime-windows-tsf --release --target x86_64-pc-windows-msvc
 $dll = (Resolve-Path .\target\x86_64-pc-windows-msvc\release\ime_windows_tsf.dll).Path
-& "$env:WINDIR\System32\regsvr32.exe" /s $dll
-if ($LASTEXITCODE -ne 0) { throw "registration failed: $LASTEXITCODE" }
+$register = Start-Process -FilePath "$env:WINDIR\System32\regsvr32.exe" -ArgumentList @('/s', "`"$dll`"") -Wait -PassThru
+if ($register.ExitCode -ne 0) { throw "registration failed: $($register.ExitCode)" }
 ```
 
 The profile should appear under the Simplified Chinese input methods after signing out and back in. Select it in a plain text editor and check that Latin keys still pass through. Test activation and deactivation in a disposable Windows account. The DLL must remain at the registered path while the profile is installed.
@@ -19,8 +19,8 @@ The profile should appear under the Simplified Chinese input methods after signi
 Remove the probe with:
 
 ```powershell
-& "$env:WINDIR\System32\regsvr32.exe" /s /u $dll
-if ($LASTEXITCODE -ne 0) { throw "unregistration failed: $LASTEXITCODE" }
+$unregister = Start-Process -FilePath "$env:WINDIR\System32\regsvr32.exe" -ArgumentList @('/s', '/u', "`"$dll`"") -Wait -PassThru
+if ($unregister.ExitCode -ne 0) { throw "unregistration failed: $($unregister.ExitCode)" }
 ```
 
 The Windows CI job compiles the native DLL, runs tests, then checks COM registration and removal. A CI green build does not establish Word/Chromium/Win32 host behavior, callback timing, edit-session safety, or packaging.
