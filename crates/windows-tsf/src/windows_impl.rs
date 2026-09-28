@@ -333,7 +333,21 @@ fn register_tsf() -> Result<()> {
             profiles.Register(&CLSID_WUFAN)?;
             registration_trace("register_tsf: profile registered");
             let label: Vec<u16> = "Wufan TSF Probe".encode_utf16().collect();
-            profiles.AddLanguageProfile(&CLSID_WUFAN, 0x0804, &PROFILE_WUFAN, &label, &[], 0)?;
+            // The icon path is optional in TSF, but windows-rs's slice wrapper cannot pass a
+            // null pointer: an empty slice still has a non-null dangling pointer. Use the raw
+            // vtable for this call so TSF receives the documented NULL icon path.
+            (Interface::vtable(&profiles).AddLanguageProfile)(
+                Interface::as_raw(&profiles),
+                &CLSID_WUFAN,
+                0x0804,
+                &PROFILE_WUFAN,
+                PCWSTR(label.as_ptr()),
+                label.len() as u32,
+                PCWSTR::null(),
+                0,
+                0,
+            )
+            .ok()?;
             registration_trace("register_tsf: language added");
             categories.RegisterCategory(&CLSID_WUFAN, &GUID_TFCAT_TIP_KEYBOARD, &CLSID_WUFAN)?;
             registration_trace("register_tsf: category registered");
