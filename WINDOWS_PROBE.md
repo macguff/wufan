@@ -2,6 +2,14 @@
 
 The current DLL is an **integration probe**. It registers a Simplified Chinese TSF keyboard profile called **Wufan TSF Probe**, implements the COM class factory and TSF activation/key sink, and passes every key to the host. It does not yet produce Chinese text or connect to RuntimeCore/Broker. Do not treat it as a usable IME release.
 
+## Current limitations
+
+- Every key is passed through: `OnTestKeyDown`/`OnKeyDown` return `BOOL(0)` and no composition or commit is created, so only Latin input works.
+- There is **no 中/英 mode button and no right-click menu**. The taskbar input indicator is provided by Windows, but the language bar item (`ITfLangBarItemButton`) and the open/close compartment (`GUID_COMPARTMENT_KEYBOARD_OPENCLOSE`) are not implemented, so 中/英 cannot be switched and there is no per-application mode memory.
+- There is no candidate window and no IPC to a broker.
+
+These are covered by gates **G9** (language bar item & menu) and **G10** (mode compartment & per-application memory) in [ADR-006](3.md); see the Slice 1 deliverables in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
+
 ## Build and inspect on Windows x64
 
 Use a Windows 10/11 x64 machine with Visual Studio 2022 C++ build tools, Windows SDK, and the pinned Rust toolchain. Open an elevated PowerShell session as the account that will test the profile, then run from the repository root:

@@ -1,6 +1,6 @@
 # Windows IME 实现计划
 
-依据：[Slice 0 v0.2](1.md)、[Runtime Architecture v1.0](2.md)、[ADR-006 v0.2](3.md)。本计划以文档的批准边界为准：当前可以初始化仓库并实现纯 RuntimeCore；真实 TSF 集成须先完成 Slice 0 出口验收和 TSF spike 的 G1–G8。
+依据：[Slice 0 v0.2](1.md)、[Runtime Architecture v1.0](2.md)、[ADR-006 v0.3](3.md)。本计划以文档的批准边界为准：当前可以初始化仓库并实现纯 RuntimeCore；真实 TSF 集成须先完成 Slice 0 出口验收和 TSF spike 的 G1–G10。
 
 ## 交付顺序与门槛
 
@@ -11,7 +11,7 @@
 | 0C 核心业务转换 | key、focus、session、composition、commit、UI intent、故障降级 | I2/I3/I6 与非法消息门禁通过模型和确定性调度验证 |
 | 0D 部署与独立 Memory 模型 | drain/cancel、D6 持久提交、启动恢复；EventDot 去重模型 | I4/I5 的故障矩阵通过；部署不能产生部分提交状态 |
 | 0E Slice 0 验收 | M01–M26、随机探索、prefix safety、trace replay、故障注入报告 | [阶段 0 出口条件](1.md#22-阶段-0-出口条件)全部满足，才进入真实 TSF Adapter |
-| 1 TSF discovery | Rust + windows-rs 最小 Stub、fake Broker、真实宿主观测 | 两周 timebox 内全部通过 G1–G8；否则切换唯一 C++ raw COM fallback |
+| 1 TSF discovery | Rust + windows-rs 最小 Stub、fake Broker、真实宿主观测 | 两周 timebox 内全部通过 G1–G10；否则切换唯一 C++ raw COM fallback |
 | 2 安全异步 IPC | named pipe、认证、版本化 envelope、有界队列、deadline | 重复、乱序、断连、恶意 frame 和身份伪造测试通过 |
 | 3 librime Broker | `rime-sys`、`rime-adapter`、`RimeEngine`、session strand | fake engine 与真实 librime 的协议/生命周期测试通过 |
 | 4 宿主与候选窗 | 多宿主故障矩阵、native HWND 候选窗 | 焦点、DPI、geometry、UI stall 和宿主关闭测试通过 |
@@ -30,7 +30,7 @@
 | 0C-2 | 部分完成 | at-most-once commit reducer、terminal cache、重复 intent/result、reject/indeterminate/timeout 区分；CandidateView revision/count 门禁、UIActionIntent 与键盘共享 FIFO/request_seq、stale geometry 拒绝模型、OS 身份/signature/dev-trust 策略模型已有；composition update/termination 与 full-ledger/cache/queue 分支有针对性测试。 |
 | 0D | 模型雏形 | D6 前后恢复/rollback、active sessions drain gate 与 EventDot/version-vector 独立模型已有；deployment 的 32 × 1,000 故障交错现在逐步检查 phase-local D6 invariant。真实持久化 adapter 与各存储故障点注入仍缺。 |
 | 0E | 模型场景部分覆盖 | M01–M26 用例映射见 [SLICE0_SCENARIO_MATRIX.md](SLICE0_SCENARIO_MATRIX.md)；二进制轨迹格式及校验解码见 [TRACE_FORMAT.md](crates/test-harness/TRACE_FORMAT.md)。Runtime 固定 16 × 1,000 步 + nightly 新 seed，另有 32 个至少 1,000 步的可收缩 `proptest` trace；随机 Runtime prefix 经 fake scheduler 核验合法状态、S1/S3、Applied/journal 一致性与无重复 ApplyHostCommit，专门属性验证六个身份字段和 commit 终态/I6。deployment/Memory 各 32 × 1,000 步探索，并逐步检查 D6 invariant。Rust 1.91.1 LLVM coverage 本机报告通过（合计 region 90.87%、line 93.95%；RuntimeCore region 90.76%、line 93.67%）；branch 计数不可用。仍缺完整 reducer transition coverage 和远端 CI 报告；失败时的最小 trace 已接入落盘及 CI artifact 上传，但远端产物尚未验证。 |
-| 1 | 探针已起步 | `ime-windows-tsf` 已实现 COM class factory、TSF activation/key sink、HKCU COM 与 TSF profile/category 注册入口；按键仍全部透传。Windows target `check` 已通过，原生链接、注册运行和真实宿主 G1–G8 均待 Windows runner 验证。参见 [WINDOWS_PROBE.md](WINDOWS_PROBE.md)。 |
+| 1 | 探针已起步 | `ime-windows-tsf` 已实现 COM class factory、TSF activation/key sink、HKCU COM 与 TSF profile/category 注册入口；按键仍全部透传，且尚未实现语言栏项（`ITfLangBarItemButton`）与中英模式 compartment，因此没有中/英切换图标和右键菜单。Windows target `check` 已通过，原生链接、注册运行和真实宿主 G1–G10 均待 Windows runner 验证。参见 [WINDOWS_PROBE.md](WINDOWS_PROBE.md)。 |
 | 2–5 | 未开始 | 安全 IPC、librime、候选窗和部署尚未实现；当前产物不能作为可用中文输入法发布。 |
 
 当前验证使用锁定的 Rust 1.91.1；完整 `cargo run --locked -p xtask -- ci` 通过（39 个 RuntimeCore、30 个 harness 测试），Windows target `cargo check --locked --workspace --target x86_64-pc-windows-msvc` 与 TSF crate 的 Windows target Clippy 通过。Linux 上缺少 `link.exe`，无法完成 Windows DLL 链接或运行。Commit effect scope 与 host journal 已按 `(client_instance_id, session_id, commit_id)` 绑定，并有 I2/I4/I5/I6 合并 oracle 用例。真实 Windows SDK、MSVC、TSF 注册与宿主验证仍未执行；现在只能把 DLL 作为待验证的透传探针，不能当作可用中文输入法。
@@ -88,7 +88,15 @@
 
 ### Slice 1：TSF discovery 与最小 Adapter
 
-用 Rust + windows-rs 做两周 spike，测真实 TestKey/Key/auto-repeat、edit session 内 commit/termination、caret geometry、DPI、context stack、callback 等待图、COM apartment 和生命周期。G1–G8 必须全部通过；任一失败，Stub 改用 thin C++ raw COM + WRL/项目自有最小 RAII，RuntimeCore 与协议保持原样。真实 callback 以 duration、等待图和 Broker kill injection 验证 I1；测试宿主至少覆盖 Word、Chromium 和传统 Win32。
+用 Rust + windows-rs 做两周 spike，测真实 TestKey/Key/auto-repeat、edit session 内 commit/termination、caret geometry、DPI、context stack、callback 等待图、COM apartment 和生命周期。G1–G10 必须全部通过；任一失败，Stub 改用 thin C++ raw COM + WRL/项目自有最小 RAII，RuntimeCore 与协议保持原样。真实 callback 以 duration、等待图和 Broker kill injection 验证 I1；测试宿主至少覆盖 Word、Chromium 和传统 Win32。
+
+**G9/G10 交付内容（语言栏与模式状态）：**
+
+- 中英状态由 `GUID_COMPARTMENT_KEYBOARD_OPENCLOSE` 统一表示，激活/切换/停用时与 Windows 输入指示器同步；全/半角与中文标点等走 `GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION`。
+- Ctrl+Space、Shift 等切换键经 `ITfKeystrokeMgr::PreserveKey` 注册、由 `OnPreservedKey` 处理，只产生一次同步决策，不阻塞 host callback。
+- 语言栏模式按钮用 `ITfLangBarItemButton` + `ITfLangBarItemMgr::AddItem` 注册，图标/文本随模式更新；右键 `GetMenu` 提供自定义 `ITfMenu`。菜单项不直接 mutation 引擎，只产生带 session/revision 的 UI intent。
+- **分应用状态记忆（跨重启持久化）**：中/英状态按前台应用（前台进程/session）分别记忆，切回该应用时恢复，并跨重启持久化；应用身份从 OS 获取，不信任 wire payload；该记忆必须可机械测试，并在宿主关闭/崩溃后收敛到合法默认值。记忆的 key、存储位置、owner 与恢复语义在实现阶段确定。
+- 悬浮状态条/候选窗不在 Slice 1，留给 Slice 4 的 `candidate-ui`；Slice 1 只做 TSF 语言栏项。
 
 ### Slice 2：安全异步 IPC
 
