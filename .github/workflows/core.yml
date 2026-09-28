@@ -18,11 +18,16 @@ jobs:
       - run: cargo test --locked --workspace --target x86_64-pc-windows-msvc
       - name: Register and remove TSF probe
         shell: pwsh
+        env:
+          WUFAN_TSF_PROBE_TRACE: ${{ runner.temp }}/wufan-tsf-registration.txt
         run: |
           $ErrorActionPreference = 'Stop'
           $dll = (Resolve-Path 'target/x86_64-pc-windows-msvc/release/ime_windows_tsf.dll').Path
           $register = Start-Process -FilePath "$env:WINDIR/System32/regsvr32.exe" -ArgumentList @('/s', "`"$dll`"") -Wait -PassThru
-          if ($register.ExitCode -ne 0) { throw "TSF registration failed: $($register.ExitCode)" }
+          if ($register.ExitCode -ne 0) {
+            if (Test-Path $env:WUFAN_TSF_PROBE_TRACE) { Get-Content $env:WUFAN_TSF_PROBE_TRACE }
+            throw "TSF registration failed: $($register.ExitCode)"
+          }
           try {
             $key = 'Registry::HKEY_CURRENT_USER\Software\Classes\CLSID\{58F68769-239A-4DCA-854E-57AA887E979B}\InprocServer32'
             $registered = (Get-Item -LiteralPath $key).GetValue('')

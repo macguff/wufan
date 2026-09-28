@@ -1,4 +1,5 @@
 use core::ffi::c_void;
+use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
@@ -30,6 +31,18 @@ use windows::Win32::UI::TextServices::{
 pub const CLSID_WUFAN: GUID = GUID::from_u128(0x58f68769_239a_4dca_854e_57aa887e979b);
 const PROFILE_WUFAN: GUID = GUID::from_u128(0x9de41ec9_bcc0_4dd8_90c8_975f03c3ef73);
 const CLSID_STRING: &str = "{58F68769-239A-4DCA-854E-57AA887E979B}";
+
+fn registration_trace(stage: &str) {
+    if let Some(path) = std::env::var_os("WUFAN_TSF_PROBE_TRACE") {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{stage}");
+        }
+    }
+}
 
 static SERVER_LOCKS: AtomicU32 = AtomicU32::new(0);
 static LIVE_OBJECTS: AtomicU32 = AtomicU32::new(0);
@@ -221,6 +234,7 @@ fn set_registry_value(key: HKEY, name: &str, value: &str) -> Result<()> {
 }
 
 fn dll_path() -> Result<String> {
+    registration_trace("dll_path: begin");
     let mut module = HMODULE::default();
     // SAFETY: the address belongs to this module; the flag asks for its handle without changing
     // its reference count. The pointer is used as an address, not dereferenced as UTF-16.
@@ -234,6 +248,7 @@ fn dll_path() -> Result<String> {
     let mut buffer = vec![0u16; 32768];
     // SAFETY: module is live and the buffer is writable.
     let length = unsafe { GetModuleFileNameW(Some(module), &mut buffer) } as usize;
+    registration_trace("dll_path: module path read");
     if length == 0 || length >= buffer.len() {
         return Err(Error::from(E_POINTER));
     }
@@ -241,6 +256,7 @@ fn dll_path() -> Result<String> {
 }
 
 fn register_com() -> Result<()> {
+    registration_trace("register_com: begin");
     let path = format!("Software\\Classes\\CLSID\\{CLSID_STRING}\\InprocServer32");
     let mut key = HKEY::default();
     let path = wide(&path);
@@ -259,12 +275,15 @@ fn register_com() -> Result<()> {
         )
     }
     .ok()?;
+    registration_trace("register_com: key created");
     let result = (|| {
         set_registry_value(key, "", &dll_path()?)?;
+        registration_trace("register_com: default value set");
         set_registry_value(key, "ThreadingModel", "Apartment")
     })();
     // SAFETY: key came from RegCreateKeyExW.
     unsafe { RegCloseKey(key) }.ok()?;
+    registration_trace("register_com: key closed");
     result
 }
 
@@ -291,7 +310,9 @@ fn with_com<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 }
 
 fn register_tsf() -> Result<()> {
+    registration_trace("register_tsf: begin");
     with_com(|| {
+        registration_trace("register_tsf: COM initialized");
         // SAFETY: class identifiers refer to Windows TSF services.
         let profiles: ITfInputProcessorProfiles = unsafe {
             CoCreateInstance(
@@ -307,11 +328,15 @@ fn register_tsf() -> Result<()> {
                 CLSCTX_INPROC_SERVER,
             )?
         };
+        registration_trace("register_tsf: services created");
         unsafe {
             profiles.Register(&CLSID_WUFAN)?;
+            registration_trace("register_tsf: profile registered");
             let label: Vec<u16> = "Wufan TSF Probe".encode_utf16().collect();
             profiles.AddLanguageProfile(&CLSID_WUFAN, 0x0804, &PROFILE_WUFAN, &label, &[], 0)?;
+            registration_trace("register_tsf: language added");
             categories.RegisterCategory(&CLSID_WUFAN, &GUID_TFCAT_TIP_KEYBOARD, &CLSID_WUFAN)?;
+            registration_trace("register_tsf: category registered");
         }
         Ok(())
     })
@@ -333,6 +358,7 @@ fn unregister_tsf() -> Result<()> {
 
 #[no_mangle]
 pub extern "system" fn DllRegisterServer() -> HRESULT {
+    registration_trace("DllRegisterServer: entry");
     if let Err(error) = register_com() {
         let _ = unregister_com();
         return error.code();
