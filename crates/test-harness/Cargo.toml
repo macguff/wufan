@@ -1,0 +1,16 @@
+[package]
+name = "ime-test-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ime-protocol = { path = "../protocol" }
+ime-runtime-core = { path = "../runtime-core" }
+
+[dev-dependencies]
+proptest = "1.11"
+
+[lib]
+path = "src/lib.rs"

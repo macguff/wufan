@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/runtime-core",
+    "crates/test-harness",
+    "crates/xtask",
+    "crates/windows-tsf",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.81"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+codegen-units = 1

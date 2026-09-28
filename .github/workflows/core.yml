@@ -1,0 +1,99 @@
+name: core
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 4 * * *"
+
+jobs:
+  windows-msvc:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - run: cargo build --locked --workspace --release --target x86_64-pc-windows-msvc
+      - run: cargo test --locked --workspace --target x86_64-pc-windows-msvc
+      - name: Register and remove TSF probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = (Resolve-Path 'target/x86_64-pc-windows-msvc/release/ime_windows_tsf.dll').Path
+          & "$env:WINDIR/System32/regsvr32.exe" /s $dll
+          if ($LASTEXITCODE -ne 0) { throw "TSF registration failed: $LASTEXITCODE" }
+          try {
+            $key = 'Registry::HKEY_CURRENT_USER\Software\Classes\CLSID\{58F68769-239A-4DCA-854E-57AA887E979B}\InprocServer32'
+            $registered = (Get-Item -LiteralPath $key).GetValue('')
+            if ($registered -ne $dll) { throw "COM registration path mismatch: $registered" }
+            $clsid = [guid]'58f68769-239a-4dca-854e-57aa887e979b'
+            $comType = [type]::GetTypeFromCLSID($clsid)
+            $instance = [Activator]::CreateInstance($comType)
+            if ($null -eq $instance) { throw 'COM activation returned null' }
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($instance)
+          } finally {
+            & "$env:WINDIR/System32/regsvr32.exe" /s /u $dll
+            if ($LASTEXITCODE -ne 0) { throw "TSF unregistration failed: $LASTEXITCODE" }
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-tsf-probe-x64
+          path: target/x86_64-pc-windows-msvc/release/ime_windows_tsf.dll
+          if-no-files-found: ignore
+
+  core:
+    runs-on: ubuntu-24.04
+    env:
+      WUFAN_TRACE_ARTIFACT_DIR: target/slice0-failure-traces
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.145
+      - run: cargo run --locked -p xtask -- ci
+      - run: cargo run --locked -p xtask -- test-nextest
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: slice0-failure-traces
+          path: target/slice0-failure-traces
+          if-no-files-found: ignore
+
+  coverage:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: -C instrument-coverage
+      LLVM_PROFILE_FILE: coverage/%p-%m.profraw
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          components: llvm-tools-preview
+      - name: Run instrumented model suite
+        run: |
+          mkdir -p coverage
+          cargo test --locked --workspace --no-fail-fast
+      - name: Produce coverage report
+        run: |
+          tool_bin="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin"
+          "$tool_bin/llvm-profdata" merge -sparse coverage/*.profraw -o coverage/merged.profdata
+          harness_bin="$(find target/debug/deps -maxdepth 1 -type f -executable -name 'ime_test_harness-*' -print -quit)"
+          runtime_bin="$(find target/debug/deps -maxdepth 1 -type f -executable -name 'ime_runtime_core-*' -print -quit)"
+          test -n "$harness_bin"
+          test -n "$runtime_bin"
+          "$tool_bin/llvm-cov" report --ignore-filename-regex='/.cargo/|/rustc/' --instr-profile=coverage/merged.profdata "$harness_bin" --object="$runtime_bin" | tee coverage/report.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slice0-coverage
+          path: coverage/report.txt
+
+  nightly-property:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - name: Select fresh deterministic nightly seed
+        run: echo "WUFAN_EXTRA_SEED=$(date +%s%N)" >> "$GITHUB_ENV"
+      - run: cargo test --locked -p ime-test-harness seeded_mixed_traces_preserve_prefix_invariants_and_replay_identically

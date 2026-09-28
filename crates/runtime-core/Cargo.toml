@@ -1,0 +1,13 @@
+[package]
+name = "ime-runtime-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ime-protocol = { path = "../protocol" }
+
+[lib]
+path = "src/lib.rs"
+

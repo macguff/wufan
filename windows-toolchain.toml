@@ -1,0 +1,10 @@
+# Pinned Windows build tools. Update this file deliberately with the matching CI image.
+[windows]
+visual_studio = "17.12.4"
+windows_sdk = "10.0.26100.0"
+windows_app_sdk = "1.6.250205002"
+dotnet_sdk = "8.0.408"
+llvm = "19.1.7"
+cmake = "3.31.6"
+ninja = "1.12.1"
+nextest = "0.9.145"
