@@ -72,7 +72,9 @@ jobs:
   coverage:
     runs-on: ubuntu-24.04
     env:
-      RUSTFLAGS: -C instrument-coverage
+      # Rust 1.91.1 needs the pinned unstable coverage option to emit LLVM branch counters.
+      RUSTC_BOOTSTRAP: '1'
+      RUSTFLAGS: -C instrument-coverage -Z coverage-options=branch
       LLVM_PROFILE_FILE: ${{ github.workspace }}/coverage/%p-%m.profraw
     steps:
       - uses: actions/checkout@v4
@@ -93,10 +95,15 @@ jobs:
           test -n "$harness_bin"
           test -n "$runtime_bin"
           "$tool_bin/llvm-cov" report --ignore-filename-regex='/.cargo/|/rustc/' --instr-profile=coverage/merged.profdata "$harness_bin" --object="$runtime_bin" | tee coverage/report.txt
+          "$tool_bin/llvm-cov" export --ignore-filename-regex='/.cargo/|/rustc/' --instr-profile=coverage/merged.profdata "$harness_bin" --object="$runtime_bin" > coverage/coverage.json
+          python3 scripts/audit_reducer_branches.py coverage/coverage.json | tee coverage/reducer-branch-audit.txt
       - uses: actions/upload-artifact@v4
         with:
           name: slice0-coverage
-          path: coverage/report.txt
+          path: |
+            coverage/report.txt
+            coverage/coverage.json
+            coverage/reducer-branch-audit.txt
 
   nightly-property:
     if: github.event_name == 'schedule'

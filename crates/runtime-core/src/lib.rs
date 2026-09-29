@@ -249,8 +249,27 @@ pub struct TransitionResult {
     pub effects: [Option<Effect>; 2],
 }
 
+#[cfg(test)]
+thread_local! {
+    static TRANSITION_RETURN_SITES: std::cell::RefCell<Option<std::collections::BTreeSet<u32>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[track_caller]
+fn record_transition_return_site() {
+    let line = std::panic::Location::caller().line();
+    TRANSITION_RETURN_SITES.with(|sites| {
+        if let Some(sites) = sites.borrow_mut().as_mut() {
+            sites.insert(line);
+        }
+    });
+}
+
 impl TransitionResult {
+    #[cfg_attr(test, track_caller)]
     fn unchanged(state: RuntimeState, immediate: Option<ImmediateReply>) -> Self {
+        #[cfg(test)]
+        record_transition_return_site();
         Self {
             next_state: state,
             immediate,
@@ -258,7 +277,10 @@ impl TransitionResult {
         }
     }
 
+    #[cfg_attr(test, track_caller)]
     fn one(state: RuntimeState, immediate: Option<ImmediateReply>, effect: Effect) -> Self {
+        #[cfg(test)]
+        record_transition_return_site();
         Self {
             next_state: state,
             immediate,
@@ -457,18 +479,18 @@ impl KeyDecisionLedger {
         self.entries.iter().filter(|entry| entry.is_some()).count()
     }
 
-    fn insert(&mut self, key: KeyObservation, key_up: bool, decision: EatDecision) -> bool {
-        if let Some(slot) = self.entries.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(KeyDecision {
-                key,
-                key_up,
-                decision,
-                expires_at_ms: key.now_ms.saturating_add(DECISION_TTL_MS),
-            });
-            true
-        } else {
-            false
-        }
+    fn insert(&mut self, key: KeyObservation, key_up: bool, decision: EatDecision) {
+        let slot = self
+            .entries
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .expect("capacity is checked before inserting a key decision");
+        *slot = Some(KeyDecision {
+            key,
+            key_up,
+            decision,
+            expires_at_ms: key.now_ms.saturating_add(DECISION_TTL_MS),
+        });
     }
 
     fn consume(&mut self, actual: KeyObservation, key_up: bool) -> Option<EatDecision> {
@@ -575,7 +597,7 @@ impl RuntimeState {
     }
 
     fn dispatch_next_key(&mut self) -> Option<Effect> {
-        if self.pending_request.is_some() {
+        if self.pending_request.is_some() || self.pending_commit.is_some() {
             return None;
         }
         while let Some(queued) = self.dequeue_key() {
@@ -1036,17 +1058,10 @@ fn reduce_key_callback(
                 return recover_queue_overflow(state, key_up);
             }
             let decision = EatDecision::Eat;
-            if !state.key_decisions.insert(key, key_up, decision) {
-                let effect_id = state.allocate_effect();
-                return TransitionResult::one(
-                    state,
-                    Some(callback_reply(phase, key_up, EatDecision::Pass)),
-                    Effect::RecordDiagnostic {
-                        effect_id,
-                        code: DiagnosticCode::KeyDecisionLedgerFull,
-                    },
-                );
-            }
+            // The capacity check above and this mutation are in the same pure transition, so a
+            // free entry is guaranteed. Treat violation as an internal invariant failure rather
+            // than keeping a second, unreachable overflow transition.
+            state.key_decisions.insert(key, key_up, decision);
             TransitionResult::unchanged(state, Some(callback_reply(phase, key_up, decision)))
         }
         KeyPhase::Actual => {
@@ -1295,6 +1310,11 @@ fn reduce_inner(mut state: RuntimeState, event: Event) -> TransitionResult {
                 TransitionResult::unchanged(state, None)
             }
         }
+        Event::FocusGained { session }
+            if state.focus == FocusState::Focused && state.active_session == Some(session) =>
+        {
+            TransitionResult::unchanged(state, None)
+        }
         Event::FocusGained { session } | Event::ContextPushed { session } => {
             let old_session = state.active_session;
             state.focus_epoch = Epoch(state.focus_epoch.0.saturating_add(1));
@@ -1302,13 +1322,11 @@ fn reduce_inner(mut state: RuntimeState, event: Event) -> TransitionResult {
             state.active_session = Some(session);
             if state.pending_commit.is_none() {
                 match state.composition {
-                    CompositionState::Active { epoch } if old_session != Some(session) => {
+                    CompositionState::Active { epoch } if old_session.is_some() => {
                         state.composition_epoch =
                             Epoch(state.composition_epoch.0.saturating_add(1));
                         state.key_decisions = KeyDecisionLedger::new();
-                        if state.pending_commit.is_none() {
-                            state.clear_queued_mutations();
-                        }
+                        state.clear_queued_mutations();
                         let effect = begin_composition_cancel(
                             &mut state,
                             old_session.unwrap_or(session),
@@ -1531,6 +1549,7 @@ fn reduce_inner(mut state: RuntimeState, event: Event) -> TransitionResult {
             if !identity_context_is_current(&state, identity)
                 || state.pending_request.map(|pending| pending.request_seq)
                     != Some(identity.request_seq)
+                || state.pending_commit.is_some()
                 || state.pending_composition_ack.is_some()
             {
                 return TransitionResult::unchanged(state, None);
@@ -1879,18 +1898,13 @@ fn reduce_inner(mut state: RuntimeState, event: Event) -> TransitionResult {
                 };
                 return TransitionResult::one(state, None, effect);
             }
-            if state.mode != RuntimeMode::Normal
-                || state.focus != FocusState::Focused
-                || identity.client_instance_id != state.client_instance_id
-                || state.broker_generation != Some(identity.broker_generation)
-                || identity.focus_epoch != state.focus_epoch
-                || state.active_session != Some(session)
-                || state.composition != (CompositionState::Active { epoch })
+            // identity_is_current above already gates mode, focus, client, broker,
+            // session, and both epochs. Only commit-specific preconditions remain.
+            if state.composition != (CompositionState::Active { epoch })
                 || state.pending_commit.is_some()
                 || state
                     .pending_request
                     .map_or(true, |request| request.request_seq != identity.request_seq)
-                || !identity_is_current(&state, identity)
             {
                 return diagnostic_transition(state, DiagnosticCode::StaleCommitIntent);
             }
@@ -2544,7 +2558,14 @@ mod tests {
         };
         for (index, entry) in state.commits.iter_mut().enumerate() {
             *entry = Some(CommitEntry {
-                identity,
+                identity: if index == 0 {
+                    MessageIdentity {
+                        focus_epoch: Epoch(0),
+                        ..identity
+                    }
+                } else {
+                    identity
+                },
                 commit_id: CommitId(100 + index as u64),
                 status: CommitStatus::Rejected,
             });
@@ -2576,6 +2597,99 @@ mod tests {
         );
         assert!(lost.effects.iter().all(Option::is_none));
         assert!(lost.next_state.structural_invariants_hold());
+    }
+
+    #[test]
+    fn new_focus_during_applying_commit_preserves_old_terminal_obligation() {
+        let applying = reduce(composing_state(), commit_intent());
+        let Some(Effect::ApplyHostCommit {
+            effect_id,
+            client_instance_id,
+            session,
+            epoch,
+            commit_id,
+            ..
+        }) = applying.effects[0]
+        else {
+            panic!("commit intent must emit a host commit");
+        };
+        let switched = reduce(
+            applying.next_state,
+            Event::FocusGained {
+                session: SessionId(4),
+            },
+        );
+        assert_eq!(switched.next_state.active_session, Some(SessionId(4)));
+        assert_eq!(
+            switched.next_state.pending_commit,
+            applying.next_state.pending_commit
+        );
+        assert!(switched.next_state.model_invariants_hold());
+
+        let new_identity = MessageIdentity {
+            client_instance_id,
+            broker_generation: BrokerGeneration(2),
+            session_id: SessionId(4),
+            focus_epoch: switched.next_state.focus_epoch,
+            composition_epoch: switched.next_state.composition_epoch,
+            request_seq: switched.next_state.last_request_seq,
+        };
+        let stale_view = reduce(
+            switched.next_state,
+            Event::CandidateViewUpdated {
+                identity: new_identity,
+                revision: 1,
+                candidate_count: 1,
+            },
+        );
+        assert!(matches!(
+            stale_view.effects[0],
+            Some(Effect::RecordDiagnostic {
+                code: DiagnosticCode::StaleCandidateView,
+                ..
+            })
+        ));
+        let stale_action = reduce(
+            switched.next_state,
+            Event::UIActionIntent {
+                identity: new_identity,
+                revision: 0,
+                candidate_index: 0,
+            },
+        );
+        assert!(matches!(
+            stale_action.effects[0],
+            Some(Effect::RecordDiagnostic {
+                code: DiagnosticCode::StaleUiAction,
+                ..
+            })
+        ));
+
+        let completed = reduce(
+            switched.next_state,
+            Event::EffectResult {
+                effect_id,
+                result_class: EffectResultClass::HostCommit,
+                scope: EffectScope::Commit {
+                    client_instance_id,
+                    session,
+                    epoch,
+                    commit_id,
+                },
+                outcome: EffectOutcome::Succeeded,
+                host_revision: Some(HostRevision(19)),
+            },
+        );
+        assert_eq!(completed.next_state.active_session, Some(SessionId(4)));
+        assert_eq!(completed.next_state.pending_commit, None);
+        assert!(completed.next_state.commits.iter().flatten().any(|entry| {
+            entry.commit_id == commit_id
+                && entry.status
+                    == CommitStatus::Applied {
+                        host_revision: HostRevision(19),
+                    }
+        }));
+        assert!(completed.next_state.model_invariants_hold());
     }
 
     #[test]
@@ -2797,6 +2911,14 @@ mod tests {
     }
 
     #[test]
+    fn empty_mutating_queue_pump_is_a_noop() {
+        let state = focused_state();
+        let pumped = reduce(state, Event::PumpMutatingQueue);
+        assert_eq!(pumped.next_state, state);
+        assert_eq!(pumped.effects, [None, None]);
+    }
+
+    #[test]
     fn engine_update_rejects_wrong_or_exhausted_composition_epoch() {
         let (state, identity) = dispatched_key_identity(focused_state(), 78);
         let stale_epoch = reduce(
@@ -2809,6 +2931,42 @@ mod tests {
         assert_eq!(stale_epoch.next_state, state);
         assert!(stale_epoch.effects.iter().all(Option::is_none));
 
+        let empty_wrong_epoch = reduce(
+            state,
+            Event::EngineUpdate {
+                identity: MessageIdentity {
+                    composition_epoch: Epoch(state.composition_epoch.0 + 1),
+                    ..identity
+                },
+                preedit_token_id: None,
+            },
+        );
+        assert_eq!(empty_wrong_epoch.next_state, state);
+        assert_eq!(empty_wrong_epoch.effects, [None, None]);
+
+        let active = composing_state();
+        let Event::CommitIntent {
+            identity: active_identity,
+            ..
+        } = commit_intent()
+        else {
+            unreachable!()
+        };
+        for preedit_token_id in [Some(1), None] {
+            let wrong_epoch = reduce(
+                active,
+                Event::EngineUpdate {
+                    identity: MessageIdentity {
+                        composition_epoch: Epoch(8),
+                        ..active_identity
+                    },
+                    preedit_token_id,
+                },
+            );
+            assert_eq!(wrong_epoch.next_state, active);
+            assert_eq!(wrong_epoch.effects, [None, None]);
+        }
+
         let mut exhausted = state;
         exhausted.composition_epoch = Epoch(u64::MAX);
         let exhausted_update = reduce(
@@ -2820,6 +2978,97 @@ mod tests {
         );
         assert_eq!(exhausted_update.next_state, exhausted);
         assert!(exhausted_update.effects.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn engine_update_ignores_stale_request_and_mismatched_active_composition() {
+        let (state, identity) = dispatched_key_identity(focused_state(), 78);
+        let stale_request = reduce(
+            state,
+            Event::EngineUpdate {
+                identity: MessageIdentity {
+                    request_seq: RequestSeq(identity.request_seq.0.saturating_add(1)),
+                    ..identity
+                },
+                preedit_token_id: Some(1),
+            },
+        );
+        assert_eq!(stale_request.next_state, state);
+        assert_eq!(stale_request.effects, [None, None]);
+
+        let mut inconsistent = state;
+        inconsistent.composition_epoch = Epoch(9);
+        inconsistent.composition = CompositionState::Active { epoch: Epoch(8) };
+        // This deliberately bypasses `reduce`'s prefix invariant assertion to cover the
+        // reducer's defensive fallback for a malformed persisted/internal state.
+        let ignored = reduce_inner(
+            inconsistent,
+            Event::EngineUpdate {
+                identity: MessageIdentity {
+                    composition_epoch: Epoch(9),
+                    ..identity
+                },
+                preedit_token_id: Some(2),
+            },
+        );
+        assert_eq!(ignored.next_state, inconsistent);
+        assert_eq!(ignored.effects, [None, None]);
+    }
+
+    #[test]
+    fn engine_update_waits_for_in_flight_composition_result() {
+        let (state, mut identity) = dispatched_key_identity(focused_state(), 79);
+        identity.composition_epoch = Epoch(state.composition_epoch.0 + 1);
+        let started = reduce(
+            state,
+            Event::EngineUpdate {
+                identity,
+                preedit_token_id: Some(1),
+            },
+        );
+        let duplicate = reduce(
+            started.next_state,
+            Event::EngineUpdate {
+                identity,
+                preedit_token_id: Some(2),
+            },
+        );
+        assert_eq!(duplicate.next_state, started.next_state);
+        assert_eq!(duplicate.effects, [None, None]);
+        assert!(matches!(
+            duplicate.next_state.composition,
+            CompositionState::Starting { .. }
+        ));
+
+        let Some(Effect::BeginHostComposition {
+            effect_id,
+            session,
+            epoch,
+            ..
+        }) = started.effects[0]
+        else {
+            panic!("first update must begin composition");
+        };
+        let key_completed = reduce(started.next_state, Event::RequestCompleted { identity });
+        assert_eq!(key_completed.next_state.pending_request, None);
+        let completed = reduce(
+            key_completed.next_state,
+            Event::EffectResult {
+                effect_id,
+                result_class: EffectResultClass::CompositionStart,
+                scope: EffectScope::Composition { session, epoch },
+                outcome: EffectOutcome::Succeeded,
+                host_revision: None,
+            },
+        );
+        assert_eq!(
+            completed.next_state.composition,
+            CompositionState::Active { epoch }
+        );
+        assert!(matches!(
+            completed.effects[0],
+            Some(Effect::SendRequestAck { .. })
+        ));
     }
 
     #[test]
@@ -2888,6 +3137,39 @@ mod tests {
 
     #[test]
     fn context_push_terminates_old_context_without_orphaning_start_effects() {
+        let composing = composing_state();
+        let repeated_focus = reduce(
+            composing,
+            Event::FocusGained {
+                session: SessionId(3),
+            },
+        );
+        assert_eq!(repeated_focus.next_state, composing);
+        assert_eq!(repeated_focus.effects, [None, None]);
+
+        let same_session_context = reduce(
+            composing,
+            Event::ContextPushed {
+                session: SessionId(3),
+            },
+        );
+        assert!(matches!(
+            same_session_context.effects[0],
+            Some(Effect::CancelComposition {
+                session: SessionId(3),
+                epoch: Epoch(9),
+                ..
+            })
+        ));
+        assert!(matches!(
+            same_session_context.next_state.composition,
+            CompositionState::Terminating {
+                epoch: Epoch(9),
+                ..
+            }
+        ));
+        assert!(same_session_context.next_state.model_invariants_hold());
+
         let pushed = reduce(
             composing_state(),
             Event::ContextPushed {
@@ -3312,6 +3594,152 @@ mod tests {
     }
 
     #[test]
+    fn commit_deadline_marks_result_indeterminate_and_drops_late_terminal() {
+        let started = reduce(composing_state(), commit_intent());
+        let Some(Effect::ApplyHostCommit {
+            effect_id,
+            client_instance_id,
+            session,
+            epoch,
+            commit_id,
+            ..
+        }) = started.effects[0]
+        else {
+            panic!("commit intent starts one host commit effect");
+        };
+        let request_seq = started
+            .next_state
+            .pending_commit
+            .unwrap()
+            .identity
+            .request_seq;
+        let expired = reduce(started.next_state, Event::DeadlineExpired { request_seq });
+        assert_eq!(expired.next_state.pending_commit, None);
+        assert_eq!(expired.next_state.mode, RuntimeMode::Passthrough);
+        assert!(expired.next_state.commits.iter().flatten().any(|entry| {
+            entry.commit_id == commit_id && entry.status == CommitStatus::Indeterminate
+        }));
+        assert!(matches!(
+            expired.effects[0],
+            Some(Effect::EnterPassthrough { .. })
+        ));
+
+        let late = reduce(
+            expired.next_state,
+            Event::EffectResult {
+                effect_id,
+                result_class: EffectResultClass::HostCommit,
+                scope: EffectScope::Commit {
+                    client_instance_id,
+                    session,
+                    epoch,
+                    commit_id,
+                },
+                outcome: EffectOutcome::Succeeded,
+                host_revision: Some(HostRevision(99)),
+            },
+        );
+        assert!(matches!(
+            late.effects[0],
+            Some(Effect::RecordDiagnostic {
+                code: DiagnosticCode::StaleEffectResult,
+                ..
+            })
+        ));
+        assert_eq!(late.next_state.mode, expired.next_state.mode);
+        assert_eq!(late.next_state.commits, expired.next_state.commits);
+        assert_eq!(late.next_state.pending_commit, None);
+    }
+
+    #[test]
+    fn commit_terminal_survives_prior_key_request_completion() {
+        let Event::CommitIntent { identity, .. } = commit_intent() else {
+            unreachable!()
+        };
+        let queued_key = key(98, 66, 3);
+        let tested = reduce(
+            composing_state(),
+            Event::HostKey {
+                phase: KeyPhase::Test,
+                key: queued_key,
+            },
+        );
+        let queued = reduce(
+            tested.next_state,
+            Event::HostKey {
+                phase: KeyPhase::Actual,
+                key: queued_key,
+            },
+        );
+        assert_eq!(queued.next_state.queue_len, 1);
+        let applying = reduce(queued.next_state, commit_intent());
+        let Some(Effect::ApplyHostCommit {
+            effect_id,
+            client_instance_id,
+            session,
+            epoch,
+            commit_id,
+            ..
+        }) = applying.effects[0]
+        else {
+            panic!("commit intent must emit a host commit");
+        };
+        let key_completed = reduce(applying.next_state, Event::RequestCompleted { identity });
+        assert_eq!(key_completed.next_state.pending_request, None);
+        assert_eq!(
+            key_completed.next_state.pending_commit,
+            applying.next_state.pending_commit
+        );
+        assert_eq!(key_completed.next_state.queue_len, 1);
+        assert!(key_completed.effects.iter().all(Option::is_none));
+        let premature_pump = reduce(key_completed.next_state, Event::PumpMutatingQueue);
+        assert_eq!(premature_pump.next_state.queue_len, 1);
+        assert!(premature_pump.effects.iter().all(Option::is_none));
+        assert!(key_completed.next_state.model_invariants_hold());
+
+        let committed = reduce(
+            key_completed.next_state,
+            Event::EffectResult {
+                effect_id,
+                result_class: EffectResultClass::HostCommit,
+                scope: EffectScope::Commit {
+                    client_instance_id,
+                    session,
+                    epoch,
+                    commit_id,
+                },
+                outcome: EffectOutcome::Succeeded,
+                host_revision: Some(HostRevision(20)),
+            },
+        );
+        assert_eq!(committed.next_state.pending_commit, None);
+        assert!(committed.next_state.commits.iter().flatten().any(|entry| {
+            entry.commit_id == commit_id
+                && entry.status
+                    == CommitStatus::Applied {
+                        host_revision: HostRevision(20),
+                    }
+        }));
+        assert!(matches!(
+            committed.effects[0],
+            Some(Effect::SendCommitApplied { .. })
+        ));
+        let dispatched = reduce(committed.next_state, Event::PumpMutatingQueue);
+        assert!(matches!(
+            dispatched.effects[0],
+            Some(Effect::SendKey {
+                identity: MessageIdentity {
+                    request_seq: RequestSeq(2),
+                    ..
+                },
+                token: 98,
+                ..
+            })
+        ));
+        assert_eq!(dispatched.next_state.queue_len, 0);
+    }
+
+    #[test]
     fn candidate_intents_share_the_mutation_sequence_and_reject_stale_views() {
         let mut state = focused_state();
         state.composition_epoch = Epoch(9);
@@ -3409,6 +3837,124 @@ mod tests {
         );
         assert!(matches!(
             invalid_index.effects[0],
+            Some(Effect::RecordDiagnostic {
+                code: DiagnosticCode::StaleUiAction,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn candidate_and_ui_guards_reject_stale_or_out_of_range_intents() {
+        let (idle, idle_identity) = dispatched_key_identity(focused_state(), 79);
+        let idle_view = reduce(
+            idle,
+            Event::CandidateViewUpdated {
+                identity: idle_identity,
+                revision: 1,
+                candidate_count: 1,
+            },
+        );
+        assert!(matches!(
+            idle_view.effects[0],
+            Some(Effect::RecordDiagnostic {
+                code: DiagnosticCode::StaleCandidateView,
+                ..
+            })
+        ));
+        let idle_action = reduce(
+            idle,
+            Event::UIActionIntent {
+                identity: idle_identity,
+                revision: 0,
+                candidate_index: 0,
+            },
+        );
+        assert!(matches!(
+            idle_action.effects[0],
+            Some(Effect::RecordDiagnostic {
+                code: DiagnosticCode::StaleUiAction,
+                ..
+            })
+        ));
+
+        let mut state = focused_state();
+        state.composition_epoch = Epoch(9);
+        state.composition = CompositionState::Active { epoch: Epoch(9) };
+        let (state, identity) = dispatched_key_identity(state, 80);
+        let view = reduce(
+            state,
+            Event::CandidateViewUpdated {
+                identity,
+                revision: 4,
+                candidate_count: 3,
+            },
+        )
+        .next_state;
+
+        for event in [
+            Event::CandidateViewUpdated {
+                identity,
+                revision: 4,
+                candidate_count: 9,
+            },
+            Event::CandidateViewUpdated {
+                identity: MessageIdentity {
+                    request_seq: RequestSeq(identity.request_seq.0 + 1),
+                    ..identity
+                },
+                revision: 5,
+                candidate_count: 9,
+            },
+        ] {
+            let rejected = reduce(view, event);
+            assert_eq!(rejected.next_state.candidate_view_revision, 4);
+            assert_eq!(rejected.next_state.candidate_count, 3);
+            assert!(matches!(
+                rejected.effects[0],
+                Some(Effect::RecordDiagnostic {
+                    code: DiagnosticCode::StaleCandidateView,
+                    ..
+                })
+            ));
+        }
+
+        let out_of_range = reduce(
+            view,
+            Event::UIActionIntent {
+                identity,
+                revision: 4,
+                candidate_index: 3,
+            },
+        );
+        assert_eq!(out_of_range.next_state.queue_len, view.queue_len);
+        assert!(matches!(
+            out_of_range.effects[0],
+            Some(Effect::RecordDiagnostic {
+                code: DiagnosticCode::StaleUiAction,
+                ..
+            })
+        ));
+
+        let committing = reduce(view, commit_intent());
+        let blocked = reduce(
+            committing.next_state,
+            Event::UIActionIntent {
+                identity,
+                revision: 4,
+                candidate_index: 1,
+            },
+        );
+        assert_eq!(
+            blocked.next_state.pending_commit,
+            committing.next_state.pending_commit
+        );
+        assert_eq!(
+            blocked.next_state.queue_len,
+            committing.next_state.queue_len
+        );
+        assert!(matches!(
+            blocked.effects[0],
             Some(Effect::RecordDiagnostic {
                 code: DiagnosticCode::StaleUiAction,
                 ..
@@ -3607,6 +4153,107 @@ mod tests {
         assert_eq!(transition.immediate, None);
     }
 
+    #[test]
+    fn key_callbacks_fail_open_at_counter_limits_and_during_termination() {
+        let observation = key(97, 65, 1);
+        let mut exhausted_epoch = focused_state();
+        exhausted_epoch.composition_epoch = Epoch(u64::MAX);
+        let epoch_reply = reduce(
+            exhausted_epoch,
+            Event::HostKey {
+                phase: KeyPhase::Test,
+                key: observation,
+            },
+        );
+        assert_eq!(
+            epoch_reply.immediate,
+            Some(ImmediateReply::TestKey(EatDecision::Pass))
+        );
+
+        let mut exhausted_request = focused_state();
+        exhausted_request.last_request_seq = RequestSeq(u64::MAX);
+        for phase in [KeyPhase::Test, KeyPhase::Actual] {
+            let reply = reduce(
+                exhausted_request,
+                Event::HostKey {
+                    phase,
+                    key: observation,
+                },
+            );
+            assert_eq!(
+                reply.immediate,
+                Some(callback_reply(phase, false, EatDecision::Pass))
+            );
+            assert!(reply.effects.iter().all(Option::is_none));
+        }
+
+        let lost = reduce(
+            composing_state(),
+            Event::FocusLost {
+                session: SessionId(3),
+            },
+        );
+        let refocused = reduce(
+            lost.next_state,
+            Event::FocusGained {
+                session: SessionId(4),
+            },
+        );
+        assert!(matches!(
+            refocused.next_state.composition,
+            CompositionState::Terminating { .. }
+        ));
+        let actual = reduce(
+            refocused.next_state,
+            Event::HostKey {
+                phase: KeyPhase::Actual,
+                key: observation,
+            },
+        );
+        assert_eq!(
+            actual.immediate,
+            Some(ImmediateReply::Key(EatDecision::Pass))
+        );
+        assert!(actual.effects.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn s2_s3_oracles_reject_malformed_effect_batches_and_replies() {
+        let diagnostic = Some(Effect::RecordDiagnostic {
+            effect_id: EffectId(1),
+            code: DiagnosticCode::InvalidTransition,
+        });
+        assert!(validate_effect_batch(&[diagnostic, None]));
+        assert!(!validate_effect_batch(&[None, diagnostic]));
+        assert!(!validate_effect_batch(&[diagnostic, diagnostic]));
+
+        let key_down = Event::HostKey {
+            phase: KeyPhase::Test,
+            key: key(1, 65, 1),
+        };
+        let key_up = Event::HostKeyUp {
+            phase: KeyPhase::Actual,
+            key: key(1, 65, 2),
+        };
+        let non_callback = Event::FocusGained {
+            session: SessionId(3),
+        };
+        assert!(!reply_matches_event(key_down, None));
+        assert!(!reply_matches_event(
+            key_down,
+            Some(ImmediateReply::Key(EatDecision::Pass))
+        ));
+        assert!(!reply_matches_event(key_up, None));
+        assert!(!reply_matches_event(
+            key_up,
+            Some(ImmediateReply::TestKeyUp(EatDecision::Pass))
+        ));
+        assert!(!reply_matches_event(
+            non_callback,
+            Some(ImmediateReply::TestKey(EatDecision::Pass))
+        ));
+    }
+
     fn composing_state() -> RuntimeState {
         let mut state = focused_state();
         let tested = reduce(
@@ -3673,6 +4320,73 @@ mod tests {
             .flatten()
             .any(|effect| matches!(effect, Effect::ApplyHostCommit { .. })));
         assert!(duplicate.next_state.structural_invariants_hold());
+
+        let Event::CommitIntent {
+            identity, token_id, ..
+        } = commit_intent()
+        else {
+            unreachable!()
+        };
+        let different_commit = reduce(
+            first.next_state,
+            Event::CommitIntent {
+                identity,
+                commit_id: CommitId(45),
+                token_id,
+            },
+        );
+        assert_eq!(
+            different_commit.next_state.pending_commit,
+            first.next_state.pending_commit
+        );
+        assert!(matches!(
+            different_commit.effects[0],
+            Some(Effect::RecordDiagnostic {
+                code: DiagnosticCode::StaleCommitIntent,
+                ..
+            })
+        ));
+
+        for preedit_token_id in [Some(7), None] {
+            let blocked_update = reduce(
+                first.next_state,
+                Event::EngineUpdate {
+                    identity,
+                    preedit_token_id,
+                },
+            );
+            assert_eq!(blocked_update.next_state, first.next_state);
+            assert_eq!(blocked_update.effects, [None, None]);
+        }
+
+        let observation = key(91, 66, 3);
+        let tested = reduce(
+            first.next_state,
+            Event::HostKey {
+                phase: KeyPhase::Test,
+                key: observation,
+            },
+        );
+        assert_eq!(
+            tested.immediate,
+            Some(ImmediateReply::TestKey(EatDecision::Pass))
+        );
+        let actual = reduce(
+            tested.next_state,
+            Event::HostKey {
+                phase: KeyPhase::Actual,
+                key: observation,
+            },
+        );
+        assert_eq!(
+            actual.immediate,
+            Some(ImmediateReply::Key(EatDecision::Pass))
+        );
+        assert_eq!(
+            actual.next_state.pending_commit,
+            first.next_state.pending_commit
+        );
+        assert!(actual.effects.iter().all(Option::is_none));
     }
 
     #[test]
@@ -3851,5 +4565,90 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn deterministic_scenarios_cover_every_transition_return_site() {
+        let scenarios: &[fn()] = &[
+            ambiguous_physical_key_match_fails_open,
+            applying_duplicate_is_acknowledged_without_a_second_host_effect,
+            broker_disconnect_cancels_active_host_composition,
+            broker_disconnect_during_composition_start_cancels_after_start_result,
+            candidate_intent_at_capacity_is_diagnostic_only,
+            candidate_intent_dispatches_immediately_when_mutation_lane_is_idle,
+            candidate_intents_share_the_mutation_sequence_and_reject_stale_views,
+            candidate_and_ui_guards_reject_stale_or_out_of_range_intents,
+            composition_can_update_and_terminate_through_effect_results,
+            commit_deadline_marks_result_indeterminate_and_drops_late_terminal,
+            commit_terminal_survives_prior_key_request_completion,
+            context_push_terminates_old_context_without_orphaning_start_effects,
+            deadline_with_active_composition_emits_cancel_obligation,
+            decision_ttl_event_expires_only_the_matching_elapsed_entry,
+            empty_engine_update_acks_request_without_composition_effect,
+            empty_mutating_queue_pump_is_a_noop,
+            engine_update_ignores_stale_request_and_mismatched_active_composition,
+            engine_update_rejects_wrong_or_exhausted_composition_epoch,
+            engine_update_starts_composition_and_stale_start_is_cancelled,
+            engine_update_waits_for_in_flight_composition_result,
+            failed_composition_update_or_termination_fails_open,
+            focus_loss_cancels_composition_as_a_single_obligation_effect,
+            focus_loss_during_applying_commit_preserves_terminal_obligation,
+            full_key_decision_ledger_returns_pass_with_diagnostic,
+            full_ledger_passes_without_eating_the_key,
+            host_close_and_deactivation_never_wait_and_cancel_active_composition,
+            host_close_during_applying_commit_keeps_commit_terminal_obligation,
+            host_commit_cache_capacity_fails_closed_without_new_effect,
+            key_up_callbacks_match_only_key_up_ledger_entries_and_preserve_direction,
+            key_callbacks_fail_open_at_counter_limits_and_during_termination,
+            mismatched_focus_loss_is_diagnostic_and_new_focus_preserves_pending_cancel,
+            model_invariant_rejects_stable_active_composition_in_failed_states,
+            modifier_release_bookkeeping_is_independent_of_mutating_queue_pressure,
+            mutating_deadline_fails_to_passthrough_and_ignores_late_reply,
+            mutating_requests_are_queued_in_order_with_a_single_request_in_flight,
+            new_focus_during_applying_commit_preserves_old_terminal_obligation,
+            non_callback_events_have_no_immediate_reply,
+            physical_modifier_map_tracks_each_side_and_ignores_non_modifiers,
+            pump_dispatches_a_queued_mutation_when_lane_is_idle,
+            queue_overflow_terminates_active_composition_and_fails_open,
+            reducer_is_deterministic_for_the_same_trace,
+            rejected_and_indeterminate_commit_have_distinct_terminal_paths,
+            stale_commit_identity_is_rejected_before_host_effect,
+            successful_commit_is_terminal_and_duplicate_only_resends_ack,
+            test_and_actual_callbacks_return_the_same_synchronous_decision,
+            unknown_effect_result_cannot_mutate_host_state,
+            unmatched_or_expired_actual_callback_fails_open,
+        ];
+
+        TRANSITION_RETURN_SITES.with(|sites| {
+            *sites.borrow_mut() = Some(std::collections::BTreeSet::new());
+        });
+        for scenario in scenarios {
+            scenario();
+        }
+        let observed = TRANSITION_RETURN_SITES.with(|sites| {
+            sites
+                .borrow_mut()
+                .take()
+                .expect("transition site capture was installed")
+        });
+
+        let production_source = include_str!("lib.rs")
+            .split("mod tests {")
+            .next()
+            .expect("test module boundary exists");
+        let expected: std::collections::BTreeSet<u32> = production_source
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                (line.contains("TransitionResult::unchanged(")
+                    || line.contains("TransitionResult::one("))
+                .then_some(index as u32 + 1)
+            })
+            .collect();
+        let uncovered: Vec<u32> = expected.difference(&observed).copied().collect();
+        assert!(
+            uncovered.is_empty(),
+            "deterministic reducer scenarios missed transition return sites at lines {uncovered:?}"
+        );
     }
 }

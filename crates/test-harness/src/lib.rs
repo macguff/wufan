@@ -1807,6 +1807,148 @@ mod tests {
     }
 
     #[test]
+    fn fake_scheduler_covers_every_terminal_effect_result() {
+        use ime_protocol::{Epoch, MessageIdentity, RequestSeq};
+        use ime_runtime_core::{CommitStatus, EffectOutcome, EffectResultClass, RuntimeMode};
+
+        let session = SessionId(8);
+        for (result_class, preedit_token_id) in [
+            (EffectResultClass::CompositionStart, Some(7)),
+            (EffectResultClass::CompositionUpdate, Some(8)),
+            (EffectResultClass::CompositionTermination, None),
+        ] {
+            for (behavior, outcome) in [
+                (FakeCompositionBehavior::Success, EffectOutcome::Succeeded),
+                (FakeCompositionBehavior::Rejected, EffectOutcome::Rejected),
+                (
+                    FakeCompositionBehavior::Indeterminate,
+                    EffectOutcome::Indeterminate,
+                ),
+            ] {
+                let mut initial = active_request_state(session, Epoch(9));
+                let epoch = if result_class == EffectResultClass::CompositionStart {
+                    initial.composition = CompositionState::Idle;
+                    initial.composition_epoch = Epoch(0);
+                    Epoch(1)
+                } else {
+                    Epoch(9)
+                };
+                let identity = MessageIdentity {
+                    client_instance_id: ClientInstanceId(5),
+                    broker_generation: ime_protocol::BrokerGeneration(2),
+                    session_id: session,
+                    focus_epoch: Epoch(1),
+                    composition_epoch: epoch,
+                    request_seq: RequestSeq(1),
+                };
+                let mut adapter = FakeEffectAdapter {
+                    composition_behavior: behavior,
+                    ..FakeEffectAdapter::default()
+                };
+                let run = run_with_fake_adapter(
+                    initial,
+                    [Event::EngineUpdate {
+                        identity,
+                        preedit_token_id,
+                    }],
+                    &mut adapter,
+                );
+                let events = decode_trace_events(initial, &run.canonical_trace).unwrap();
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        Event::EffectResult {
+                            result_class: actual_class,
+                            outcome: actual_outcome,
+                            ..
+                        } if *actual_class == result_class && *actual_outcome == outcome
+                    )),
+                    "missing {result_class:?}/{outcome:?} terminal result"
+                );
+                assert_eq!(replay(initial, events), run);
+                if outcome == EffectOutcome::Succeeded {
+                    assert_eq!(run.state.mode, RuntimeMode::Normal);
+                    assert_eq!(
+                        run.state.composition,
+                        if result_class == EffectResultClass::CompositionTermination {
+                            CompositionState::Idle
+                        } else {
+                            CompositionState::Active { epoch }
+                        }
+                    );
+                } else {
+                    assert_eq!(run.state.mode, RuntimeMode::Passthrough);
+                    assert_eq!(run.state.composition, CompositionState::Idle);
+                }
+                assert!(adapter.host_mutations.is_empty());
+            }
+        }
+
+        for (behavior, outcome, expected_writes) in [
+            (FakeCommitBehavior::Success, EffectOutcome::Succeeded, 1),
+            (FakeCommitBehavior::Rejected, EffectOutcome::Rejected, 0),
+            (
+                FakeCommitBehavior::IndeterminateBeforeWrite,
+                EffectOutcome::Indeterminate,
+                0,
+            ),
+            (
+                FakeCommitBehavior::IndeterminateAfterWrite,
+                EffectOutcome::Indeterminate,
+                1,
+            ),
+        ] {
+            let initial = active_request_state(session, Epoch(9));
+            let commit_id = CommitId(305);
+            let mut adapter = FakeEffectAdapter {
+                commit_behavior: behavior,
+                ..FakeEffectAdapter::default()
+            };
+            let run = run_with_fake_adapter(
+                initial,
+                [commit_event(session, commit_id, Epoch(9), 88)],
+                &mut adapter,
+            );
+            let events = decode_trace_events(initial, &run.canonical_trace).unwrap();
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Event::EffectResult {
+                        result_class: EffectResultClass::HostCommit,
+                        outcome: actual_outcome,
+                        ..
+                    } if *actual_outcome == outcome
+                )),
+                "missing commit {outcome:?} terminal result"
+            );
+            assert_eq!(replay(initial, events), run);
+            assert_eq!(
+                adapter.mutation_count(ClientInstanceId(5), session, commit_id),
+                expected_writes
+            );
+            let status = run
+                .state
+                .commit_entries()
+                .find(|entry| entry.commit_id == commit_id)
+                .expect("commit must have a terminal cache entry")
+                .status;
+            assert!(match outcome {
+                EffectOutcome::Succeeded => matches!(status, CommitStatus::Applied { .. }),
+                EffectOutcome::Rejected => status == CommitStatus::Rejected,
+                EffectOutcome::Indeterminate => status == CommitStatus::Indeterminate,
+            });
+            assert_eq!(
+                run.state.mode,
+                if outcome == EffectOutcome::Indeterminate {
+                    RuntimeMode::Passthrough
+                } else {
+                    RuntimeMode::Normal
+                }
+            );
+        }
+    }
+
+    #[test]
     fn m01_thirty_keys_per_second_remain_ordered_and_unique() {
         let connected = reduce(
             RuntimeState::new(ime_protocol::ClientInstanceId(5)),
