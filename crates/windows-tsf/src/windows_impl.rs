@@ -1,12 +1,16 @@
 use core::ffi::c_void;
+use std::cell::RefCell;
 use std::io::Write;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use ime_pinyin_engine::{EngineReply, Preedit};
 use windows::core::{
     implement, Error, IUnknown, IUnknownImpl, Interface, Ref, Result, BOOL, BSTR, GUID, HRESULT,
     PCWSTR,
@@ -30,14 +34,16 @@ use windows::Win32::System::Registry::{
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::TextServices::{
     CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, ITfCategoryMgr, ITfCompartment,
-    ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfContext,
-    ITfInputProcessorProfiles, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
-    ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr, ITfLangBarItemSink,
-    ITfLangBarItem_Impl, ITfMenu, ITfSource, ITfSource_Impl, ITfTextInputProcessor,
-    ITfTextInputProcessor_Impl, ITfThreadMgr, GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
-    GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, GUID_TFCAT_TIP_KEYBOARD, TF_CONVERSIONMODE_NATIVE,
-    TF_LANGBARITEMINFO, TF_LBI_CLK_LEFT, TF_LBI_ICON, TF_LBI_STATUS, TF_LBI_STYLE_BTN_BUTTON,
-    TF_LBI_STYLE_BTN_MENU, TF_LBI_TEXT, TF_MOD_CONTROL, TF_PRESERVEDKEY,
+    ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfComposition,
+    ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextComposition, ITfEditSession,
+    ITfEditSession_Impl, ITfInputProcessorProfiles, ITfInsertAtSelection, ITfKeyEventSink,
+    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfLangBarItemButton, ITfLangBarItemButton_Impl,
+    ITfLangBarItemMgr, ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu, ITfSource, ITfSource_Impl,
+    ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadMgr,
+    GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
+    GUID_TFCAT_TIP_KEYBOARD, TF_CONVERSIONMODE_NATIVE, TF_ES_ASYNC, TF_ES_READWRITE,
+    TF_IAS_NO_DEFAULT_COMPOSITION, TF_LANGBARITEMINFO, TF_LBI_CLK_LEFT, TF_LBI_ICON, TF_LBI_STATUS,
+    TF_LBI_STYLE_BTN_BUTTON, TF_LBI_STYLE_BTN_MENU, TF_LBI_TEXT, TF_MOD_CONTROL, TF_PRESERVEDKEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CopyIcon, LoadIconW, IDI_APPLICATION, IDI_INFORMATION,
@@ -380,10 +386,12 @@ impl ITfLangBarItem_Impl for ModeButton_Impl {
         if info.is_null() {
             return Err(Error::from(E_POINTER));
         }
-        let mut value = TF_LANGBARITEMINFO::default();
-        value.clsidService = CLSID_WUFAN;
-        value.guidItem = GUID_MODE_BUTTON;
-        value.dwStyle = TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_BTN_MENU;
+        let mut value = TF_LANGBARITEMINFO {
+            clsidService: CLSID_WUFAN,
+            guidItem: GUID_MODE_BUTTON,
+            dwStyle: TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_BTN_MENU,
+            ..Default::default()
+        };
         let description: Vec<u16> = "Wufan mode".encode_utf16().collect();
         value.szDescription[..description.len()].copy_from_slice(&description);
         unsafe { info.write(value) };
@@ -557,6 +565,179 @@ impl IClassFactory_Impl for ClassFactory_Impl {
 }
 
 #[derive(Default)]
+struct CompositionData {
+    active: Option<ITfComposition>,
+}
+
+enum CompositionEdit {
+    Show(String),
+    Commit(String),
+    Cancel,
+}
+
+#[implement(ITfCompositionSink)]
+struct CompositionSink {
+    data: Rc<RefCell<CompositionData>>,
+}
+
+impl ITfCompositionSink_Impl for CompositionSink_Impl {
+    fn OnCompositionTerminated(
+        &self,
+        _edit_cookie: u32,
+        _composition: Ref<ITfComposition>,
+    ) -> Result<()> {
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            self.data.borrow_mut().active = None;
+        }));
+        Ok(())
+    }
+}
+
+#[implement(ITfEditSession)]
+struct CompositionEditSession {
+    context: ITfContext,
+    data: Rc<RefCell<CompositionData>>,
+    edit: CompositionEdit,
+}
+
+impl CompositionEditSession {
+    fn apply(&self, edit_cookie: u32) -> Result<()> {
+        match &self.edit {
+            CompositionEdit::Show(text) => {
+                let utf16: Vec<u16> = text.encode_utf16().collect();
+                let active = self.data.borrow().active.clone();
+                if let Some(composition) = active {
+                    // SAFETY: DoEditSession supplies a valid write cookie for this context.
+                    let range = unsafe { composition.GetRange()? };
+                    // SAFETY: the range belongs to this context and the UTF-16 slice is live.
+                    unsafe { range.SetText(edit_cookie, 0, &utf16)? };
+                    return Ok(());
+                }
+
+                let insert: ITfInsertAtSelection = self.context.cast()?;
+                // SAFETY: DoEditSession supplies the active context write cookie.
+                let range = unsafe {
+                    insert.InsertTextAtSelection(
+                        edit_cookie,
+                        TF_IAS_NO_DEFAULT_COMPOSITION,
+                        &utf16,
+                    )?
+                };
+                let manager: ITfContextComposition = self.context.cast()?;
+                let sink: ITfCompositionSink = CompositionSink {
+                    data: Rc::clone(&self.data),
+                }
+                .into();
+                // SAFETY: range and sink are live COM interfaces for this context edit session.
+                match unsafe { manager.StartComposition(edit_cookie, &range, &sink) } {
+                    Ok(composition) => {
+                        self.data.borrow_mut().active = Some(composition);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        // SAFETY: the inserted range remains valid under this edit cookie.
+                        let _ = unsafe { range.SetText(edit_cookie, 0, &[]) };
+                        Err(error)
+                    }
+                }
+            }
+            CompositionEdit::Commit(text) => {
+                let utf16: Vec<u16> = text.encode_utf16().collect();
+                let active = self.data.borrow().active.clone();
+                if let Some(composition) = active {
+                    // SAFETY: DoEditSession supplies a valid write cookie for this context.
+                    let range = unsafe { composition.GetRange()? };
+                    // SAFETY: the composition range is writable in this edit session.
+                    unsafe { range.SetText(edit_cookie, 0, &utf16)? };
+                    // SAFETY: the composition belongs to this context and is being terminated in its write session.
+                    unsafe { composition.EndComposition(edit_cookie)? };
+                    self.data.borrow_mut().active = None;
+                    Ok(())
+                } else {
+                    let insert: ITfInsertAtSelection = self.context.cast()?;
+                    // SAFETY: DoEditSession supplies the active context write cookie.
+                    unsafe {
+                        insert.InsertTextAtSelection(
+                            edit_cookie,
+                            TF_IAS_NO_DEFAULT_COMPOSITION,
+                            &utf16,
+                        )?;
+                    }
+                    Ok(())
+                }
+            }
+            CompositionEdit::Cancel => {
+                let active = self.data.borrow().active.clone();
+                if let Some(composition) = active {
+                    // SAFETY: DoEditSession supplies a valid write cookie for this context.
+                    let range = unsafe { composition.GetRange()? };
+                    // SAFETY: range belongs to this context and is writable under edit_cookie.
+                    unsafe {
+                        range.SetText(edit_cookie, 0, &[])?;
+                        composition.EndComposition(edit_cookie)?;
+                    }
+                    self.data.borrow_mut().active = None;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl ITfEditSession_Impl for CompositionEditSession_Impl {
+    fn DoEditSession(&self, edit_cookie: u32) -> Result<()> {
+        match catch_unwind(AssertUnwindSafe(|| self.apply(edit_cookie))) {
+            Ok(result) => result,
+            Err(_) => Err(Error::from(E_FAIL)),
+        }
+    }
+}
+
+fn queue_composition_edit(
+    context: &ITfContext,
+    client_id: u32,
+    data: &Rc<RefCell<CompositionData>>,
+    edit: CompositionEdit,
+) -> Result<()> {
+    let session: ITfEditSession = CompositionEditSession {
+        context: context.clone(),
+        data: Rc::clone(data),
+        edit,
+    }
+    .into();
+    // ASYNC keeps host key callbacks from waiting for an edit session.
+    // SAFETY: context and edit session are live, and the client ID came from TSF Activate.
+    let edit_status =
+        unsafe { context.RequestEditSession(client_id, &session, TF_ES_ASYNC | TF_ES_READWRITE)? };
+    if edit_status.0 < 0 {
+        Err(Error::from(edit_status))
+    } else {
+        Ok(())
+    }
+}
+
+fn schedule_engine_reply(
+    context: Option<&ITfContext>,
+    client_id: u32,
+    data: &Rc<RefCell<CompositionData>>,
+    reply: EngineReply,
+) -> bool {
+    let Some(context) = context else {
+        return false;
+    };
+    let edit = if let Some(commit) = reply.commit {
+        CompositionEdit::Commit(commit)
+    } else {
+        match reply.preedit {
+            Preedit::Keep => return true,
+            Preedit::Show(text) => CompositionEdit::Show(text),
+            Preedit::Hide => CompositionEdit::Cancel,
+        }
+    };
+    queue_composition_edit(context, client_id, data, edit).is_ok()
+}
+
+#[derive(Default)]
 struct Activation {
     thread_manager: Option<ITfThreadMgr>,
     keystroke_manager: Option<ITfKeystrokeMgr>,
@@ -569,14 +750,19 @@ struct Activation {
 struct TextService {
     activation: Mutex<Activation>,
     mode: Arc<ModeController>,
+    client_id: AtomicU32,
+    composition: Rc<RefCell<CompositionData>>,
 }
 
 impl TextService {
+    #[allow(clippy::arc_with_non_send_sync)]
     fn new() -> Self {
         LIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
         Self {
             activation: Mutex::new(Activation::default()),
             mode: Arc::new(ModeController::new()),
+            client_id: AtomicU32::new(0),
+            composition: Rc::new(RefCell::new(CompositionData::default())),
         }
     }
 }
@@ -669,6 +855,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         state.lang_bar_manager = Some(lang_bar_manager);
         state.lang_bar_item = Some(lang_bar_item);
         state.client_id = client_id;
+        self.client_id.store(client_id, Ordering::Release);
         Ok(())
     }
 
@@ -679,6 +866,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             .map_err(|_| Error::from(E_NOINTERFACE))?;
         let activation = std::mem::take(&mut *state);
         drop(state);
+        self.client_id.store(0, Ordering::Release);
 
         let mut first_error = None;
         if let (Some(manager), Some(item)) =
@@ -711,47 +899,104 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
 #[allow(non_snake_case)]
 impl ITfKeyEventSink_Impl for TextService_Impl {
     fn OnSetFocus(&self, foreground: BOOL) -> Result<()> {
-        if foreground.as_bool() {
-            self.mode.apply_compartment_mode(self.mode.is_chinese())?;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if foreground.as_bool() {
+                self.mode.apply_compartment_mode(self.mode.is_chinese())?;
+            } else {
+                let _ = crate::key_adapter::reset_pinyin();
+            }
+            Ok(())
+        }));
+        match result {
+            Ok(result) => result,
+            Err(_) => Ok(()),
         }
-        Ok(())
     }
     fn OnTestKeyDown(
         &self,
         _context: Ref<ITfContext>,
-        _wparam: WPARAM,
-        _lparam: LPARAM,
+        wparam: WPARAM,
+        lparam: LPARAM,
     ) -> Result<BOOL> {
-        Ok(BOOL(0))
+        Ok(crate::key_adapter::test_key_down(
+            wparam,
+            lparam,
+            self.mode.is_chinese(),
+        ))
     }
     fn OnTestKeyUp(
         &self,
         _context: Ref<ITfContext>,
-        _wparam: WPARAM,
-        _lparam: LPARAM,
+        wparam: WPARAM,
+        lparam: LPARAM,
     ) -> Result<BOOL> {
-        Ok(BOOL(0))
+        Ok(crate::key_adapter::test_key_up(wparam, lparam))
     }
-    fn OnKeyDown(
-        &self,
-        _context: Ref<ITfContext>,
-        _wparam: WPARAM,
-        _lparam: LPARAM,
-    ) -> Result<BOOL> {
-        Ok(BOOL(0))
+    fn OnKeyDown(&self, context: Ref<ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
+        let handled = catch_unwind(AssertUnwindSafe(|| {
+            let chinese_mode = self.mode.is_chinese();
+            if !chinese_mode {
+                if let Some(reply) = crate::key_adapter::reset_pinyin() {
+                    let _ = schedule_engine_reply(
+                        context.as_ref(),
+                        self.client_id.load(Ordering::Acquire),
+                        &self.composition,
+                        reply,
+                    );
+                }
+            }
+            let outcome = crate::key_adapter::key_down(wparam, lparam, chinese_mode);
+            if let Some(reply) = outcome.engine_reply {
+                if !schedule_engine_reply(
+                    context.as_ref(),
+                    self.client_id.load(Ordering::Acquire),
+                    &self.composition,
+                    reply,
+                ) {
+                    if let Some(reset) = crate::key_adapter::reset_pinyin() {
+                        let _ = schedule_engine_reply(
+                            context.as_ref(),
+                            self.client_id.load(Ordering::Acquire),
+                            &self.composition,
+                            reset,
+                        );
+                    }
+                    return BOOL(0);
+                }
+            }
+            outcome.handled
+        }))
+        .unwrap_or(BOOL(0));
+        Ok(handled)
     }
-    fn OnKeyUp(&self, _context: Ref<ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
-        Ok(BOOL(0))
+    fn OnKeyUp(&self, _context: Ref<ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
+        Ok(crate::key_adapter::key_up(wparam, lparam))
     }
     fn OnPreservedKey(&self, _context: Ref<ITfContext>, guid: *const GUID) -> Result<BOOL> {
-        if guid.is_null() {
-            return Err(Error::from(E_POINTER));
-        }
-        if unsafe { *guid } == GUID_PRESERVED_TOGGLE {
-            self.mode.toggle()?;
-            Ok(BOOL(1))
-        } else {
-            Ok(BOOL(0))
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if guid.is_null() {
+                return Err(Error::from(E_POINTER));
+            }
+            if unsafe { *guid } == GUID_PRESERVED_TOGGLE {
+                self.mode.toggle()?;
+                if let Some(reply) = crate::key_adapter::reset_pinyin() {
+                    if let Some(context) = _context.as_ref() {
+                        let _ = schedule_engine_reply(
+                            Some(context),
+                            self.client_id.load(Ordering::Acquire),
+                            &self.composition,
+                            reply,
+                        );
+                    }
+                }
+                Ok(BOOL(1))
+            } else {
+                Ok(BOOL(0))
+            }
+        }));
+        match result {
+            Ok(result) => result,
+            Err(_) => Ok(BOOL(0)),
         }
     }
 }

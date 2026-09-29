@@ -81,6 +81,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ime-pinyin-engine"
+version = "0.1.0"
+
+[[package]]
 name = "ime-protocol"
 version = "0.1.0"
 
@@ -104,6 +108,9 @@ dependencies = [
 name = "ime-windows-tsf"
 version = "0.1.0"
 dependencies = [
+ "ime-pinyin-engine",
+ "ime-protocol",
+ "ime-runtime-core",
  "windows",
  "windows-core",
 ]
