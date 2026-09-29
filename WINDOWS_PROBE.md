@@ -31,4 +31,4 @@ $unregister = Start-Process -FilePath "$env:WINDIR\System32\regsvr32.exe" -Argum
 if ($unregister.ExitCode -ne 0) { throw "unregistration failed: $($unregister.ExitCode)" }
 ```
 
-The Windows CI job compiles the native DLL, runs tests, then checks COM registration and removal. A CI green build does not establish Word/Chromium/Win32 host behavior, callback timing, edit-session safety, or packaging.
+The Windows CI job compiles the native DLL, runs tests, then performs 100 registration, COM activation, object-release, and unregistration cycles through `scripts/tsf_lifecycle.ps1`. Each cycle checks `DllCanUnloadNow` and the probe's COM/TSF registry keys. This G1 lifecycle gate still needs a successful CI run after the script change. A CI green build does not establish Word/Chromium/Win32 host behavior, callback timing, edit-session safety, or packaging.

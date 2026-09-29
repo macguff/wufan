@@ -365,8 +365,20 @@ fn unregister_tsf() -> Result<()> {
                 CLSCTX_INPROC_SERVER,
             )?
         };
-        // SAFETY: unregister removes this CLSID's profiles and categories.
-        unsafe { profiles.Unregister(&CLSID_WUFAN) }
+        let categories: ITfCategoryMgr = unsafe {
+            CoCreateInstance(
+                &CLSID_TF_CategoryMgr,
+                None::<&IUnknown>,
+                CLSCTX_INPROC_SERVER,
+            )?
+        };
+        // Both registrations belong to this CLSID. Attempt both removals even if the first
+        // fails, so a partial registration does not leave the other half behind.
+        let category_result = unsafe {
+            categories.UnregisterCategory(&CLSID_WUFAN, &GUID_TFCAT_TIP_KEYBOARD, &CLSID_WUFAN)
+        };
+        let profile_result = unsafe { profiles.Unregister(&CLSID_WUFAN) };
+        category_result.and(profile_result)
     })
 }
 

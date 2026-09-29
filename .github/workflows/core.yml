@@ -16,31 +16,13 @@ jobs:
           toolchain: 1.91.1
       - run: cargo build --locked --workspace --release --target x86_64-pc-windows-msvc
       - run: cargo test --locked --workspace --target x86_64-pc-windows-msvc
-      - name: Register and remove TSF probe
+      - name: Exercise TSF registration lifecycle (G1)
         shell: pwsh
         env:
           WUFAN_TSF_PROBE_TRACE: ${{ runner.temp }}/wufan-tsf-registration.txt
         run: |
-          $ErrorActionPreference = 'Stop'
           $dll = (Resolve-Path 'target/x86_64-pc-windows-msvc/release/ime_windows_tsf.dll').Path
-          $register = Start-Process -FilePath "$env:WINDIR/System32/regsvr32.exe" -ArgumentList @('/s', "`"$dll`"") -Wait -PassThru
-          if ($register.ExitCode -ne 0) {
-            if (Test-Path $env:WUFAN_TSF_PROBE_TRACE) { Get-Content $env:WUFAN_TSF_PROBE_TRACE }
-            throw "TSF registration failed: $($register.ExitCode)"
-          }
-          try {
-            $key = 'Registry::HKEY_CURRENT_USER\Software\Classes\CLSID\{58F68769-239A-4DCA-854E-57AA887E979B}\InprocServer32'
-            $registered = (Get-Item -LiteralPath $key).GetValue('')
-            if ($registered -ne $dll) { throw "COM registration path mismatch: $registered" }
-            $clsid = [guid]'58f68769-239a-4dca-854e-57aa887e979b'
-            $comType = [type]::GetTypeFromCLSID($clsid)
-            $instance = [Activator]::CreateInstance($comType)
-            if ($null -eq $instance) { throw 'COM activation returned null' }
-            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($instance)
-          } finally {
-            $unregister = Start-Process -FilePath "$env:WINDIR/System32/regsvr32.exe" -ArgumentList @('/s', '/u', "`"$dll`"") -Wait -PassThru
-            if ($unregister.ExitCode -ne 0) { throw "TSF unregistration failed: $($unregister.ExitCode)" }
-          }
+          ./scripts/tsf_lifecycle.ps1 -DllPath $dll -Cycles 100
       - uses: actions/upload-artifact@v4
         if: always()
         with:
