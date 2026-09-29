@@ -1,14 +1,20 @@
 use core::ffi::c_void;
 use std::io::Write;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use windows::core::{
-    implement, Error, IUnknown, IUnknownImpl, Interface, Ref, Result, BOOL, GUID, HRESULT, PCWSTR,
+    implement, Error, IUnknown, IUnknownImpl, Interface, Ref, Result, BOOL, BSTR, GUID, HRESULT,
+    PCWSTR,
 };
 use windows::Win32::Foundation::{
-    E_NOINTERFACE, E_POINTER, HMODULE, LPARAM, RPC_E_CHANGED_MODE, S_FALSE, WPARAM,
+    E_FAIL, E_NOINTERFACE, E_POINTER, HMODULE, LPARAM, RPC_E_CHANGED_MODE, S_FALSE, WPARAM,
 };
+use windows::Win32::Graphics::Gdi::HBITMAP;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, IClassFactory, IClassFactory_Impl,
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
@@ -21,16 +27,28 @@ use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::TextServices::{
-    CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, ITfCategoryMgr, ITfContext,
-    ITfInputProcessorProfiles, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
-    ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadMgr, GUID_TFCAT_TIP_KEYBOARD,
+    CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, ITfCategoryMgr, ITfCompartment,
+    ITfCompartmentMgr, ITfContext, ITfInputProcessorProfiles, ITfKeyEventSink,
+    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfLangBarItemButton, ITfLangBarItemButton_Impl,
+    ITfLangBarItemMgr, ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu, ITfSource, ITfSource_Impl,
+    ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadMgr,
+    GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
+    GUID_TFCAT_TIP_KEYBOARD, TF_CONVERSIONMODE_NATIVE, TF_LANGBARITEMINFO, TF_LBI_CLK_LEFT,
+    TF_LBI_ICON, TF_LBI_STATUS, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_STYLE_BTN_MENU, TF_LBI_TEXT,
+    TF_MOD_CONTROL, TF_PRESERVEDKEY,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CopyIcon, LoadIconW, IDI_APPLICATION, IDI_INFORMATION,
 };
 
 /// Stable CLSID for the Windows probe. Registration will use this same value.
 pub const CLSID_WUFAN: GUID = GUID::from_u128(0x58f68769_239a_4dca_854e_57aa887e979b);
 const PROFILE_WUFAN: GUID = GUID::from_u128(0x9de41ec9_bcc0_4dd8_90c8_975f03c3ef73);
 const CLSID_STRING: &str = "{58F68769-239A-4DCA-854E-57AA887E979B}";
+const GUID_MODE_BUTTON: GUID = GUID::from_u128(0xa913a196_f35b_4b7f_9dcb_a093834e0e66);
+const GUID_PRESERVED_TOGGLE: GUID = GUID::from_u128(0x9ad9bb91_62fa_42a1_b124_48f3cbf4bd70);
 
 fn registration_trace(stage: &str) {
     if let Some(path) = std::env::var_os("WUFAN_TSF_PROBE_TRACE") {
@@ -46,6 +64,349 @@ fn registration_trace(stage: &str) {
 
 static SERVER_LOCKS: AtomicU32 = AtomicU32::new(0);
 static LIVE_OBJECTS: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Clone)]
+struct Compartments {
+    open_close: ITfCompartment,
+    conversion: ITfCompartment,
+}
+
+struct ModePersistenceWorker {
+    stopped: Arc<AtomicBool>,
+    wake: SyncSender<()>,
+    thread: JoinHandle<()>,
+}
+
+impl ModePersistenceWorker {
+    fn start(mode: Arc<AtomicBool>, identity: String, path: PathBuf) -> std::io::Result<Self> {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
+        let (wake, receiver) = mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("wufan-mode-persist".to_owned())
+            .spawn(move || {
+                let mut last_written = None;
+                loop {
+                    let _ = receiver.recv_timeout(Duration::from_millis(500));
+                    let current = mode.load(Ordering::Acquire);
+                    if last_written != Some(current) {
+                        let _ = write_app_mode(&path, &identity, current);
+                        last_written = Some(current);
+                    }
+                    if worker_stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            stopped,
+            wake,
+            thread,
+        })
+    }
+
+    fn signal(&self) {
+        match self.wake.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) | Err(TrySendError::Disconnected(())) => {}
+        }
+    }
+
+    fn stop(self) {
+        self.stopped.store(true, Ordering::Release);
+        self.signal();
+        let _ = self.thread.join();
+    }
+}
+
+fn app_mode_path() -> Option<(String, PathBuf)> {
+    let mut image = vec![0u16; 32768];
+    let length = unsafe { GetModuleFileNameW(None, &mut image) } as usize;
+    if length == 0 || length >= image.len() {
+        return None;
+    }
+    let identity = String::from_utf16_lossy(&image[..length]);
+    let key = identity
+        .to_lowercase()
+        .encode_utf16()
+        .fold(0xcbf29ce484222325_u64, |hash, unit| {
+            (hash ^ u64::from(unit)).wrapping_mul(0x100000001b3)
+        });
+    let root = std::env::var_os("LOCALAPPDATA")?;
+    Some((
+        identity,
+        PathBuf::from(root)
+            .join("Wufan")
+            .join("mode-memory")
+            .join(format!("{key:016x}.state")),
+    ))
+}
+
+fn read_app_mode(path: &Path, identity: &str) -> Option<bool> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let (stored_identity, stored_mode) = contents.split_once('\n')?;
+    if !stored_identity.eq_ignore_ascii_case(identity) {
+        return None;
+    }
+    match stored_mode.trim() {
+        "chinese" => Some(true),
+        "english" => Some(false),
+        _ => None,
+    }
+}
+
+fn write_app_mode(path: &Path, identity: &str, chinese: bool) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("mode path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let value = if chinese { "chinese" } else { "english" };
+    std::fs::write(&temporary, format!("{identity}\n{value}\n"))?;
+    match std::fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) if path.exists() => {
+            std::fs::remove_file(path)?;
+            std::fs::rename(temporary, path).map_err(|_| error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+struct ModeController {
+    chinese: Arc<AtomicBool>,
+    client_id: AtomicU32,
+    compartments: Mutex<Option<Compartments>>,
+    sink: Mutex<Option<ITfLangBarItemSink>>,
+    worker: Mutex<Option<ModePersistenceWorker>>,
+}
+
+impl ModeController {
+    fn new() -> Self {
+        Self {
+            chinese: Arc::new(AtomicBool::new(true)),
+            client_id: AtomicU32::new(0),
+            compartments: Mutex::new(None),
+            sink: Mutex::new(None),
+            worker: Mutex::new(None),
+        }
+    }
+
+    fn is_chinese(&self) -> bool {
+        self.chinese.load(Ordering::Acquire)
+    }
+
+    fn start_persistence(&self, identity: String, path: PathBuf) -> Result<()> {
+        let initial = read_app_mode(&path, &identity).unwrap_or(true);
+        self.chinese.store(initial, Ordering::Release);
+        let worker = ModePersistenceWorker::start(Arc::clone(&self.chinese), identity, path)
+            .map_err(|_| Error::from(E_FAIL))?;
+        let mut current = self.worker.lock().map_err(|_| Error::from(E_NOINTERFACE))?;
+        *current = Some(worker);
+        Ok(())
+    }
+
+    fn attach_compartments(&self, client_id: u32, compartments: Compartments) -> Result<()> {
+        self.client_id.store(client_id, Ordering::Release);
+        if let Ok(mut current) = self.compartments.lock() {
+            *current = Some(compartments);
+        } else {
+            return Err(Error::from(E_NOINTERFACE));
+        }
+        self.apply_compartment_mode(self.is_chinese())
+    }
+
+    fn apply_compartment_mode(&self, chinese: bool) -> Result<()> {
+        let compartments = self
+            .compartments
+            .lock()
+            .map_err(|_| Error::from(E_NOINTERFACE))?
+            .clone();
+        if let Some(compartments) = compartments {
+            let client_id = self.client_id.load(Ordering::Acquire);
+            let open = VARIANT::from(i32::from(chinese));
+            let conversion = VARIANT::from(if chinese { TF_CONVERSIONMODE_NATIVE } else { 0 });
+            unsafe { compartments.open_close.SetValue(client_id, &open)? };
+            if let Err(error) = unsafe { compartments.conversion.SetValue(client_id, &conversion) }
+            {
+                let rollback = VARIANT::from(i32::from(!chinese));
+                let _ = unsafe { compartments.open_close.SetValue(client_id, &rollback) };
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn set(&self, chinese: bool) -> Result<()> {
+        if self.is_chinese() == chinese {
+            return Ok(());
+        }
+        self.apply_compartment_mode(chinese)?;
+        self.chinese.store(chinese, Ordering::Release);
+        let sink = self.sink.lock().ok().and_then(|sink| sink.clone());
+        if let Some(sink) = sink {
+            unsafe { sink.OnUpdate(TF_LBI_TEXT | TF_LBI_ICON | TF_LBI_STATUS)? };
+        }
+        if let Ok(worker) = self.worker.lock() {
+            if let Some(worker) = worker.as_ref() {
+                worker.signal();
+            }
+        }
+        Ok(())
+    }
+
+    fn toggle(&self) -> Result<()> {
+        self.set(!self.is_chinese())
+    }
+
+    fn stop_persistence(&self) {
+        if let Ok(mut worker) = self.worker.lock() {
+            if let Some(worker) = worker.take() {
+                worker.stop();
+            }
+        }
+    }
+}
+
+#[implement(ITfLangBarItemButton, ITfSource)]
+struct ModeButton {
+    mode: Arc<ModeController>,
+}
+
+impl ModeButton {
+    fn new(mode: Arc<ModeController>) -> Self {
+        Self { mode }
+    }
+}
+
+impl ITfLangBarItem_Impl for ModeButton_Impl {
+    fn GetInfo(&self, info: *mut TF_LANGBARITEMINFO) -> Result<()> {
+        if info.is_null() {
+            return Err(Error::from(E_POINTER));
+        }
+        let mut value = TF_LANGBARITEMINFO::default();
+        value.clsidService = CLSID_WUFAN;
+        value.guidItem = GUID_MODE_BUTTON;
+        value.dwStyle = TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_BTN_MENU;
+        let description: Vec<u16> = "Wufan mode".encode_utf16().collect();
+        value.szDescription[..description.len()].copy_from_slice(&description);
+        unsafe { info.write(value) };
+        Ok(())
+    }
+
+    fn GetStatus(&self) -> Result<u32> {
+        Ok(0)
+    }
+
+    fn Show(&self, _show: BOOL) -> Result<()> {
+        Ok(())
+    }
+
+    fn GetTooltipString(&self) -> Result<BSTR> {
+        Ok(BSTR::from(if self.mode.is_chinese() {
+            "Wufan：中文模式"
+        } else {
+            "Wufan: English mode"
+        }))
+    }
+}
+
+impl ITfLangBarItemButton_Impl for ModeButton_Impl {
+    fn OnClick(
+        &self,
+        click: windows::Win32::UI::TextServices::TfLBIClick,
+        _point: &windows::Win32::Foundation::POINT,
+        _area: *const windows::Win32::Foundation::RECT,
+    ) -> Result<()> {
+        if click == TF_LBI_CLK_LEFT {
+            self.mode.toggle()?;
+        }
+        Ok(())
+    }
+
+    fn InitMenu(&self, menu: Ref<ITfMenu>) -> Result<()> {
+        let menu = menu.as_ref().ok_or_else(|| Error::from(E_POINTER))?;
+        let chinese: Vec<u16> = "中文模式".encode_utf16().collect();
+        let english: Vec<u16> = "英文模式".encode_utf16().collect();
+        let mut submenu = None;
+        unsafe {
+            menu.AddMenuItem(
+                1,
+                0,
+                HBITMAP::default(),
+                HBITMAP::default(),
+                &chinese,
+                &mut submenu,
+            )?;
+            menu.AddMenuItem(
+                2,
+                0,
+                HBITMAP::default(),
+                HBITMAP::default(),
+                &english,
+                &mut submenu,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn OnMenuSelect(&self, id: u32) -> Result<()> {
+        match id {
+            1 => self.mode.set(true),
+            2 => self.mode.set(false),
+            _ => Ok(()),
+        }
+    }
+
+    fn GetIcon(&self) -> Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
+        let icon = unsafe {
+            LoadIconW(
+                None,
+                if self.mode.is_chinese() {
+                    IDI_INFORMATION
+                } else {
+                    IDI_APPLICATION
+                },
+            )?
+        };
+        unsafe { CopyIcon(icon) }
+    }
+
+    fn GetText(&self) -> Result<BSTR> {
+        Ok(BSTR::from(if self.mode.is_chinese() {
+            "中"
+        } else {
+            "英"
+        }))
+    }
+}
+
+impl ITfSource_Impl for ModeButton_Impl {
+    fn AdviseSink(&self, iid: *const GUID, unknown: Ref<IUnknown>) -> Result<u32> {
+        if iid.is_null() || unsafe { *iid } != ITfLangBarItemSink::IID {
+            return Err(Error::from(E_NOINTERFACE));
+        }
+        let unknown = unknown.as_ref().ok_or_else(|| Error::from(E_POINTER))?;
+        let sink: ITfLangBarItemSink = unknown.cast()?;
+        if let Ok(mut current) = self.mode.sink.lock() {
+            *current = Some(sink);
+            Ok(1)
+        } else {
+            Err(Error::from(E_NOINTERFACE))
+        }
+    }
+
+    fn UnadviseSink(&self, cookie: u32) -> Result<()> {
+        if cookie != 1 {
+            return Err(Error::from(E_NOINTERFACE));
+        }
+        if let Ok(mut current) = self.mode.sink.lock() {
+            *current = None;
+            Ok(())
+        } else {
+            Err(Error::from(E_NOINTERFACE))
+        }
+    }
+}
 
 #[implement(IClassFactory)]
 struct ClassFactory;
@@ -101,12 +462,16 @@ impl IClassFactory_Impl for ClassFactory_Impl {
 #[derive(Default)]
 struct Activation {
     thread_manager: Option<ITfThreadMgr>,
+    keystroke_manager: Option<ITfKeystrokeMgr>,
+    lang_bar_manager: Option<ITfLangBarItemMgr>,
+    lang_bar_item: Option<ITfLangBarItemButton>,
     client_id: u32,
 }
 
 #[implement(ITfTextInputProcessor, ITfKeyEventSink)]
 struct TextService {
     activation: Mutex<Activation>,
+    mode: Arc<ModeController>,
 }
 
 impl TextService {
@@ -114,6 +479,7 @@ impl TextService {
         LIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
         Self {
             activation: Mutex::new(Activation::default()),
+            mode: Arc::new(ModeController::new()),
         }
     }
 }
@@ -129,13 +495,81 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         let manager = manager.as_ref().ok_or_else(|| Error::from(E_POINTER))?;
         let keystrokes: ITfKeystrokeMgr = manager.cast()?;
         let sink: ITfKeyEventSink = self.to_interface();
-        // SAFETY: TSF owns the manager and callback contract; no host operation is performed here.
-        unsafe { keystrokes.AdviseKeyEventSink(client_id, &sink, true)? };
+        let mut advised = false;
+        let mut preserved = false;
+        let mut added = false;
+        let setup = (|| {
+            // SAFETY: TSF owns the manager and callback contract.
+            unsafe { keystrokes.AdviseKeyEventSink(client_id, &sink, true)? };
+            advised = true;
+
+            let key = TF_PRESERVEDKEY {
+                uVKey: 0x20,
+                uModifiers: TF_MOD_CONTROL,
+            };
+            let description: Vec<u16> =
+                "Toggle Wufan Chinese/English mode".encode_utf16().collect();
+            unsafe {
+                keystrokes.PreserveKey(client_id, &GUID_PRESERVED_TOGGLE, &key, &description)?
+            };
+            preserved = true;
+
+            let manager_compartments: ITfCompartmentMgr = manager.cast()?;
+            let compartments = Compartments {
+                open_close: unsafe {
+                    manager_compartments.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_OPENCLOSE)?
+                },
+                conversion: unsafe {
+                    manager_compartments
+                        .GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION)?
+                },
+            };
+            if let Some((identity, path)) = app_mode_path() {
+                self.mode.start_persistence(identity, path)?;
+            }
+            self.mode.attach_compartments(client_id, compartments)?;
+
+            let lang_bar_manager: ITfLangBarItemMgr = manager.cast()?;
+            let lang_bar_item: ITfLangBarItemButton =
+                ModeButton::new(Arc::clone(&self.mode)).into();
+            unsafe { lang_bar_manager.AddItem(&lang_bar_item)? };
+            added = true;
+            Ok((lang_bar_manager, lang_bar_item))
+        })();
+
+        let (lang_bar_manager, lang_bar_item) = match setup {
+            Ok(value) => value,
+            Err(error) => {
+                if added {
+                    if let Ok(manager) = manager.cast::<ITfLangBarItemMgr>() {
+                        let item: ITfLangBarItemButton =
+                            ModeButton::new(Arc::clone(&self.mode)).into();
+                        let _ = unsafe { manager.RemoveItem(&item) };
+                    }
+                }
+                if preserved {
+                    let key = TF_PRESERVEDKEY {
+                        uVKey: 0x20,
+                        uModifiers: TF_MOD_CONTROL,
+                    };
+                    let _ = unsafe { keystrokes.UnpreserveKey(&GUID_PRESERVED_TOGGLE, &key) };
+                }
+                if advised {
+                    let _ = unsafe { keystrokes.UnadviseKeyEventSink(client_id) };
+                }
+                self.mode.stop_persistence();
+                return Err(error);
+            }
+        };
+
         let mut state = self
             .activation
             .lock()
             .map_err(|_| Error::from(E_NOINTERFACE))?;
         state.thread_manager = Some(manager.clone());
+        state.keystroke_manager = Some(keystrokes);
+        state.lang_bar_manager = Some(lang_bar_manager);
+        state.lang_bar_item = Some(lang_bar_item);
         state.client_id = client_id;
         Ok(())
     }
@@ -145,18 +579,43 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             .activation
             .lock()
             .map_err(|_| Error::from(E_NOINTERFACE))?;
-        if let Some(manager) = state.thread_manager.take() {
-            let keystrokes: ITfKeystrokeMgr = manager.cast()?;
-            // SAFETY: this undoes the subscription made during activation.
-            unsafe { keystrokes.UnadviseKeyEventSink(state.client_id)? };
+        let activation = std::mem::take(&mut *state);
+        drop(state);
+
+        let mut first_error = None;
+        if let (Some(manager), Some(item)) =
+            (&activation.lang_bar_manager, &activation.lang_bar_item)
+        {
+            if let Err(error) = unsafe { manager.RemoveItem(item) } {
+                first_error = Some(error);
+            }
         }
-        Ok(())
+        if let Some(keystrokes) = &activation.keystroke_manager {
+            let key = TF_PRESERVEDKEY {
+                uVKey: 0x20,
+                uModifiers: TF_MOD_CONTROL,
+            };
+            if let Err(error) = unsafe { keystrokes.UnpreserveKey(&GUID_PRESERVED_TOGGLE, &key) } {
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = unsafe { keystrokes.UnadviseKeyEventSink(activation.client_id) } {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Ok(mut compartments) = self.mode.compartments.lock() {
+            *compartments = None;
+        }
+        self.mode.stop_persistence();
+        first_error.map_or(Ok(()), Err)
     }
 }
 
 #[allow(non_snake_case)]
 impl ITfKeyEventSink_Impl for TextService_Impl {
-    fn OnSetFocus(&self, _foreground: BOOL) -> Result<()> {
+    fn OnSetFocus(&self, foreground: BOOL) -> Result<()> {
+        if foreground.as_bool() {
+            self.mode.apply_compartment_mode(self.mode.is_chinese())?;
+        }
         Ok(())
     }
     fn OnTestKeyDown(
@@ -186,8 +645,16 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     fn OnKeyUp(&self, _context: Ref<ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         Ok(BOOL(0))
     }
-    fn OnPreservedKey(&self, _context: Ref<ITfContext>, _guid: *const GUID) -> Result<BOOL> {
-        Ok(BOOL(0))
+    fn OnPreservedKey(&self, _context: Ref<ITfContext>, guid: *const GUID) -> Result<BOOL> {
+        if guid.is_null() {
+            return Err(Error::from(E_POINTER));
+        }
+        if unsafe { *guid } == GUID_PRESERVED_TOGGLE {
+            self.mode.toggle()?;
+            Ok(BOOL(1))
+        } else {
+            Ok(BOOL(0))
+        }
     }
 }
 

@@ -1,11 +1,11 @@
 # Windows TSF probe
 
-The current DLL is an **integration probe**. It registers a Simplified Chinese TSF keyboard profile called **Wufan TSF Probe**, implements the COM class factory and TSF activation/key sink, and passes every key to the host. It does not yet produce Chinese text or connect to RuntimeCore/Broker. Do not treat it as a usable IME release.
+The current DLL is an **integration probe**. It registers a Simplified Chinese TSF keyboard profile called **Wufan TSF Probe**, implements the COM class factory, TSF activation/key sink, a language-bar mode button, and Chinese/English compartment updates. Text composition and commit are not wired to RuntimeCore/Broker, so ordinary keys still pass through to the host. Do not treat it as a usable IME release.
 
 ## Current limitations
 
-- Every key is passed through: `OnTestKeyDown`/`OnKeyDown` return `BOOL(0)` and no composition or commit is created, so only Latin input works.
-- There is **no 中/英 mode button and no right-click menu**. The taskbar input indicator is provided by Windows, but the language bar item (`ITfLangBarItemButton`) and the open/close compartment (`GUID_COMPARTMENT_KEYBOARD_OPENCLOSE`) are not implemented, so 中/英 cannot be switched and there is no per-application mode memory.
+- Ordinary keys are passed through: `OnTestKeyDown`/`OnKeyDown` return `BOOL(0)` and no composition or commit is created, so Chinese text input is not implemented.
+- The language bar exposes a 中/英 button and a right-click mode menu. Ctrl+Space toggles `GUID_COMPARTMENT_KEYBOARD_OPENCLOSE` and `GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION`. Mode is persisted per host executable under the user's `LOCALAPPDATA`; a background worker performs file writes away from key callbacks. Real synchronization with the Windows indicator, other TSFs, and Word/Chromium/Win32 hosts remains unverified.
 - There is no candidate window and no IPC to a broker.
 
 These are covered by gates **G9** (language bar item & menu) and **G10** (mode compartment & per-application memory) in [ADR-006](3.md); see the Slice 1 deliverables in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
@@ -31,4 +31,4 @@ $unregister = Start-Process -FilePath "$env:WINDIR\System32\regsvr32.exe" -Argum
 if ($unregister.ExitCode -ne 0) { throw "unregistration failed: $($unregister.ExitCode)" }
 ```
 
-The Windows CI job compiles the native DLL, runs tests, then performs 100 registration, COM activation, object-release, and unregistration cycles through `scripts/tsf_lifecycle.ps1`. Each cycle checks `DllCanUnloadNow` and the probe's COM/TSF registry keys. This G1 lifecycle gate still needs a successful CI run after the script change. A CI green build does not establish Word/Chromium/Win32 host behavior, callback timing, edit-session safety, or packaging.
+The Windows CI job compiles the native DLL, runs tests, then performs 100 registration, COM activation, object-release, and unregistration cycles through `scripts/tsf_lifecycle.ps1`. Each cycle checks `DllCanUnloadNow` and the probe's COM/TSF registry keys. The G1 lifecycle gate passed on commit `ba9866e`. A CI green build does not establish Word/Chromium/Win32 host behavior, callback timing, edit-session safety, or packaging.
