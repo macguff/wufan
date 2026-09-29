@@ -30,14 +30,14 @@ use windows::Win32::System::Registry::{
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::TextServices::{
     CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, ITfCategoryMgr, ITfCompartment,
-    ITfCompartmentMgr, ITfContext, ITfInputProcessorProfiles, ITfKeyEventSink,
-    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfLangBarItemButton, ITfLangBarItemButton_Impl,
-    ITfLangBarItemMgr, ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu, ITfSource, ITfSource_Impl,
-    ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadMgr,
-    GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
-    GUID_TFCAT_TIP_KEYBOARD, TF_CONVERSIONMODE_NATIVE, TF_LANGBARITEMINFO, TF_LBI_CLK_LEFT,
-    TF_LBI_ICON, TF_LBI_STATUS, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_STYLE_BTN_MENU, TF_LBI_TEXT,
-    TF_MOD_CONTROL, TF_PRESERVEDKEY,
+    ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfContext,
+    ITfInputProcessorProfiles, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
+    ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr, ITfLangBarItemSink,
+    ITfLangBarItem_Impl, ITfMenu, ITfSource, ITfSource_Impl, ITfTextInputProcessor,
+    ITfTextInputProcessor_Impl, ITfThreadMgr, GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
+    GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, GUID_TFCAT_TIP_KEYBOARD, TF_CONVERSIONMODE_NATIVE,
+    TF_LANGBARITEMINFO, TF_LBI_CLK_LEFT, TF_LBI_ICON, TF_LBI_STATUS, TF_LBI_STYLE_BTN_BUTTON,
+    TF_LBI_STYLE_BTN_MENU, TF_LBI_TEXT, TF_MOD_CONTROL, TF_PRESERVEDKEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CopyIcon, LoadIconW, IDI_APPLICATION, IDI_INFORMATION,
@@ -176,6 +176,7 @@ struct ModeController {
     chinese: Arc<AtomicBool>,
     client_id: AtomicU32,
     compartments: Mutex<Option<Compartments>>,
+    compartment_sources: Mutex<Vec<(ITfSource, u32)>>,
     sink: Mutex<Option<ITfLangBarItemSink>>,
     worker: Mutex<Option<ModePersistenceWorker>>,
 }
@@ -186,6 +187,7 @@ impl ModeController {
             chinese: Arc::new(AtomicBool::new(true)),
             client_id: AtomicU32::new(0),
             compartments: Mutex::new(None),
+            compartment_sources: Mutex::new(Vec::new()),
             sink: Mutex::new(None),
             worker: Mutex::new(None),
         }
@@ -205,7 +207,33 @@ impl ModeController {
         Ok(())
     }
 
-    fn attach_compartments(&self, client_id: u32, compartments: Compartments) -> Result<()> {
+    fn attach_compartments(
+        self: &Arc<Self>,
+        client_id: u32,
+        compartments: Compartments,
+    ) -> Result<()> {
+        let event_sink: ITfCompartmentEventSink = ModeCompartmentSink::new(Arc::clone(self)).into();
+        let unknown: IUnknown = event_sink.cast()?;
+        let open_source: ITfSource = compartments.open_close.cast()?;
+        let conversion_source: ITfSource = compartments.conversion.cast()?;
+        let open_cookie =
+            unsafe { open_source.AdviseSink(&ITfCompartmentEventSink::IID, &unknown)? };
+        let conversion_cookie = match unsafe {
+            conversion_source.AdviseSink(&ITfCompartmentEventSink::IID, &unknown)
+        } {
+            Ok(cookie) => cookie,
+            Err(error) => {
+                let _ = unsafe { open_source.UnadviseSink(open_cookie) };
+                return Err(error);
+            }
+        };
+        let Ok(mut sources) = self.compartment_sources.lock() else {
+            let _ = unsafe { open_source.UnadviseSink(open_cookie) };
+            let _ = unsafe { conversion_source.UnadviseSink(conversion_cookie) };
+            return Err(Error::from(E_NOINTERFACE));
+        };
+        sources.push((open_source, open_cookie));
+        sources.push((conversion_source, conversion_cookie));
         self.client_id.store(client_id, Ordering::Release);
         if let Ok(mut current) = self.compartments.lock() {
             *current = Some(compartments);
@@ -241,17 +269,40 @@ impl ModeController {
             return Ok(());
         }
         self.apply_compartment_mode(chinese)?;
-        self.chinese.store(chinese, Ordering::Release);
+        if self.chinese.swap(chinese, Ordering::AcqRel) != chinese {
+            self.notify_and_persist();
+        }
+        Ok(())
+    }
+
+    fn sync_from_compartments(&self) -> Result<()> {
+        let compartments = self
+            .compartments
+            .lock()
+            .map_err(|_| Error::from(E_NOINTERFACE))?
+            .clone()
+            .ok_or_else(|| Error::from(E_NOINTERFACE))?;
+        let open = unsafe { compartments.open_close.GetValue()? };
+        let conversion = unsafe { compartments.conversion.GetValue()? };
+        let open = i32::try_from(&open).map_err(|_| Error::from(E_NOINTERFACE))? != 0;
+        let conversion = u32::try_from(&conversion).map_err(|_| Error::from(E_NOINTERFACE))?;
+        let chinese = open && conversion & TF_CONVERSIONMODE_NATIVE != 0;
+        if self.chinese.swap(chinese, Ordering::AcqRel) != chinese {
+            self.notify_and_persist();
+        }
+        Ok(())
+    }
+
+    fn notify_and_persist(&self) {
         let sink = self.sink.lock().ok().and_then(|sink| sink.clone());
         if let Some(sink) = sink {
-            unsafe { sink.OnUpdate(TF_LBI_TEXT | TF_LBI_ICON | TF_LBI_STATUS)? };
+            let _ = unsafe { sink.OnUpdate(TF_LBI_TEXT | TF_LBI_ICON | TF_LBI_STATUS) };
         }
         if let Ok(worker) = self.worker.lock() {
             if let Some(worker) = worker.as_ref() {
                 worker.signal();
             }
         }
-        Ok(())
     }
 
     fn toggle(&self) -> Result<()> {
@@ -264,6 +315,52 @@ impl ModeController {
                 worker.stop();
             }
         }
+    }
+
+    fn detach_compartments(&self) -> Result<()> {
+        let subscriptions = {
+            let mut current = self
+                .compartment_sources
+                .lock()
+                .map_err(|_| Error::from(E_NOINTERFACE))?;
+            std::mem::take(&mut *current)
+        };
+        let mut first_error = None;
+        for (source, cookie) in subscriptions {
+            if let Err(error) = unsafe { source.UnadviseSink(cookie) } {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Ok(mut compartments) = self.compartments.lock() {
+            *compartments = None;
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+#[implement(ITfCompartmentEventSink)]
+struct ModeCompartmentSink {
+    mode: Arc<ModeController>,
+}
+
+impl ModeCompartmentSink {
+    fn new(mode: Arc<ModeController>) -> Self {
+        Self { mode }
+    }
+}
+
+impl ITfCompartmentEventSink_Impl for ModeCompartmentSink_Impl {
+    fn OnChange(&self, guid: *const GUID) -> Result<()> {
+        if guid.is_null() {
+            return Err(Error::from(E_POINTER));
+        }
+        let changed = unsafe { *guid };
+        if changed == GUID_COMPARTMENT_KEYBOARD_OPENCLOSE
+            || changed == GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION
+        {
+            self.mode.sync_from_compartments()?;
+        }
+        Ok(())
     }
 }
 
@@ -557,6 +654,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
                 if advised {
                     let _ = unsafe { keystrokes.UnadviseKeyEventSink(client_id) };
                 }
+                let _ = self.mode.detach_compartments();
                 self.mode.stop_persistence();
                 return Err(error);
             }
@@ -602,8 +700,8 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
                 first_error.get_or_insert(error);
             }
         }
-        if let Ok(mut compartments) = self.mode.compartments.lock() {
-            *compartments = None;
+        if let Err(error) = self.mode.detach_compartments() {
+            first_error.get_or_insert(error);
         }
         self.mode.stop_persistence();
         first_error.map_or(Ok(()), Err)
