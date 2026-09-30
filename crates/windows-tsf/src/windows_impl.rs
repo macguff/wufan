@@ -1,16 +1,14 @@
 use core::ffi::c_void;
-use std::cell::RefCell;
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ime_pinyin_engine::{EngineReply, Preedit};
+use crate::composition::CompositionController;
 use windows::core::{
     implement, Error, IUnknown, IUnknownImpl, Interface, Ref, Result, BOOL, BSTR, GUID, HRESULT,
     PCWSTR,
@@ -34,16 +32,15 @@ use windows::Win32::System::Registry::{
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::TextServices::{
     CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, ITfCategoryMgr, ITfCompartment,
-    ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfComposition,
-    ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextComposition, ITfEditSession,
-    ITfEditSession_Impl, ITfInputProcessorProfiles, ITfInsertAtSelection, ITfKeyEventSink,
-    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfLangBarItemButton, ITfLangBarItemButton_Impl,
-    ITfLangBarItemMgr, ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu, ITfSource, ITfSource_Impl,
-    ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadMgr,
+    ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfContext,
+    ITfInputProcessorProfiles, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
+    ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr, ITfLangBarItemSink,
+    ITfLangBarItem_Impl, ITfMenu, ITfSource, ITfSource_Impl, ITfTextInputProcessor,
+    ITfTextInputProcessor_Impl, ITfThreadMgr, ITfThreadMgrEventSink,
     GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
-    GUID_TFCAT_TIP_KEYBOARD, TF_CONVERSIONMODE_NATIVE, TF_ES_ASYNC, TF_ES_READWRITE,
-    TF_IAS_NO_DEFAULT_COMPOSITION, TF_LANGBARITEMINFO, TF_LBI_CLK_LEFT, TF_LBI_ICON, TF_LBI_STATUS,
-    TF_LBI_STYLE_BTN_BUTTON, TF_LBI_STYLE_BTN_MENU, TF_LBI_TEXT, TF_MOD_CONTROL, TF_PRESERVEDKEY,
+    GUID_TFCAT_TIP_KEYBOARD, TF_CONVERSIONMODE_NATIVE, TF_LANGBARITEMINFO, TF_LBI_CLK_LEFT,
+    TF_LBI_ICON, TF_LBI_STATUS, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_STYLE_BTN_MENU, TF_LBI_TEXT,
+    TF_MOD_CONTROL, TF_PRESERVEDKEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CopyIcon, LoadIconW, IDI_APPLICATION, IDI_INFORMATION,
@@ -70,6 +67,22 @@ fn registration_trace(stage: &str) {
 
 static SERVER_LOCKS: AtomicU32 = AtomicU32::new(0);
 static LIVE_OBJECTS: AtomicU32 = AtomicU32::new(0);
+
+/// Count callbacks retained by TSF, including after the TextService is released.
+pub(super) struct ComLifetime;
+
+impl ComLifetime {
+    pub(super) fn new() -> Self {
+        LIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ComLifetime {
+    fn drop(&mut self) {
+        LIVE_OBJECTS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone)]
 struct Compartments {
@@ -179,6 +192,7 @@ fn write_app_mode(path: &Path, identity: &str, chinese: bool) -> std::io::Result
 }
 
 struct ModeController {
+    input: CompositionController,
     chinese: Arc<AtomicBool>,
     client_id: AtomicU32,
     compartments: Mutex<Option<Compartments>>,
@@ -188,8 +202,9 @@ struct ModeController {
 }
 
 impl ModeController {
-    fn new() -> Self {
+    fn new(input: CompositionController) -> Self {
         Self {
+            input,
             chinese: Arc::new(AtomicBool::new(true)),
             client_id: AtomicU32::new(0),
             compartments: Mutex::new(None),
@@ -258,7 +273,12 @@ impl ModeController {
         if let Some(compartments) = compartments {
             let client_id = self.client_id.load(Ordering::Acquire);
             let open = VARIANT::from(i32::from(chinese));
-            let conversion = VARIANT::from(if chinese { TF_CONVERSIONMODE_NATIVE } else { 0 });
+            // TSF compartments require VT_I4, including conversion bit masks.
+            let conversion = VARIANT::from(if chinese {
+                TF_CONVERSIONMODE_NATIVE as i32
+            } else {
+                0i32
+            });
             unsafe { compartments.open_close.SetValue(client_id, &open)? };
             if let Err(error) = unsafe { compartments.conversion.SetValue(client_id, &conversion) }
             {
@@ -300,6 +320,7 @@ impl ModeController {
     }
 
     fn notify_and_persist(&self) {
+        self.input.reset(self.client_id.load(Ordering::Acquire));
         let sink = self.sink.lock().ok().and_then(|sink| sink.clone());
         if let Some(sink) = sink {
             let _ = unsafe { sink.OnUpdate(TF_LBI_TEXT | TF_LBI_ICON | TF_LBI_STATUS) };
@@ -340,6 +361,7 @@ impl ModeController {
         if let Ok(mut compartments) = self.compartments.lock() {
             *compartments = None;
         }
+        self.client_id.store(0, Ordering::Release);
         first_error.map_or(Ok(()), Err)
     }
 }
@@ -536,6 +558,7 @@ impl IClassFactory_Impl for ClassFactory_Impl {
         riid: *const GUID,
         output: *mut *mut c_void,
     ) -> Result<()> {
+        registration_trace("CreateInstance: enter");
         if output.is_null() || riid.is_null() {
             return Err(Error::from(E_POINTER));
         }
@@ -565,184 +588,15 @@ impl IClassFactory_Impl for ClassFactory_Impl {
 }
 
 #[derive(Default)]
-struct CompositionData {
-    active: Option<ITfComposition>,
-}
-
-enum CompositionEdit {
-    Show(String),
-    Commit(String),
-    Cancel,
-}
-
-#[implement(ITfCompositionSink)]
-struct CompositionSink {
-    data: Rc<RefCell<CompositionData>>,
-}
-
-impl ITfCompositionSink_Impl for CompositionSink_Impl {
-    fn OnCompositionTerminated(
-        &self,
-        _edit_cookie: u32,
-        _composition: Ref<ITfComposition>,
-    ) -> Result<()> {
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            self.data.borrow_mut().active = None;
-        }));
-        Ok(())
-    }
-}
-
-#[implement(ITfEditSession)]
-struct CompositionEditSession {
-    context: ITfContext,
-    data: Rc<RefCell<CompositionData>>,
-    edit: CompositionEdit,
-}
-
-impl CompositionEditSession {
-    fn apply(&self, edit_cookie: u32) -> Result<()> {
-        match &self.edit {
-            CompositionEdit::Show(text) => {
-                let utf16: Vec<u16> = text.encode_utf16().collect();
-                let active = self.data.borrow().active.clone();
-                if let Some(composition) = active {
-                    // SAFETY: DoEditSession supplies a valid write cookie for this context.
-                    let range = unsafe { composition.GetRange()? };
-                    // SAFETY: the range belongs to this context and the UTF-16 slice is live.
-                    unsafe { range.SetText(edit_cookie, 0, &utf16)? };
-                    return Ok(());
-                }
-
-                let insert: ITfInsertAtSelection = self.context.cast()?;
-                // SAFETY: DoEditSession supplies the active context write cookie.
-                let range = unsafe {
-                    insert.InsertTextAtSelection(
-                        edit_cookie,
-                        TF_IAS_NO_DEFAULT_COMPOSITION,
-                        &utf16,
-                    )?
-                };
-                let manager: ITfContextComposition = self.context.cast()?;
-                let sink: ITfCompositionSink = CompositionSink {
-                    data: Rc::clone(&self.data),
-                }
-                .into();
-                // SAFETY: range and sink are live COM interfaces for this context edit session.
-                match unsafe { manager.StartComposition(edit_cookie, &range, &sink) } {
-                    Ok(composition) => {
-                        self.data.borrow_mut().active = Some(composition);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        // SAFETY: the inserted range remains valid under this edit cookie.
-                        let _ = unsafe { range.SetText(edit_cookie, 0, &[]) };
-                        Err(error)
-                    }
-                }
-            }
-            CompositionEdit::Commit(text) => {
-                let utf16: Vec<u16> = text.encode_utf16().collect();
-                let active = self.data.borrow().active.clone();
-                if let Some(composition) = active {
-                    // SAFETY: DoEditSession supplies a valid write cookie for this context.
-                    let range = unsafe { composition.GetRange()? };
-                    // SAFETY: the composition range is writable in this edit session.
-                    unsafe { range.SetText(edit_cookie, 0, &utf16)? };
-                    // SAFETY: the composition belongs to this context and is being terminated in its write session.
-                    unsafe { composition.EndComposition(edit_cookie)? };
-                    self.data.borrow_mut().active = None;
-                    Ok(())
-                } else {
-                    let insert: ITfInsertAtSelection = self.context.cast()?;
-                    // SAFETY: DoEditSession supplies the active context write cookie.
-                    unsafe {
-                        insert.InsertTextAtSelection(
-                            edit_cookie,
-                            TF_IAS_NO_DEFAULT_COMPOSITION,
-                            &utf16,
-                        )?;
-                    }
-                    Ok(())
-                }
-            }
-            CompositionEdit::Cancel => {
-                let active = self.data.borrow().active.clone();
-                if let Some(composition) = active {
-                    // SAFETY: DoEditSession supplies a valid write cookie for this context.
-                    let range = unsafe { composition.GetRange()? };
-                    // SAFETY: range belongs to this context and is writable under edit_cookie.
-                    unsafe {
-                        range.SetText(edit_cookie, 0, &[])?;
-                        composition.EndComposition(edit_cookie)?;
-                    }
-                    self.data.borrow_mut().active = None;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-impl ITfEditSession_Impl for CompositionEditSession_Impl {
-    fn DoEditSession(&self, edit_cookie: u32) -> Result<()> {
-        match catch_unwind(AssertUnwindSafe(|| self.apply(edit_cookie))) {
-            Ok(result) => result,
-            Err(_) => Err(Error::from(E_FAIL)),
-        }
-    }
-}
-
-fn queue_composition_edit(
-    context: &ITfContext,
-    client_id: u32,
-    data: &Rc<RefCell<CompositionData>>,
-    edit: CompositionEdit,
-) -> Result<()> {
-    let session: ITfEditSession = CompositionEditSession {
-        context: context.clone(),
-        data: Rc::clone(data),
-        edit,
-    }
-    .into();
-    // ASYNC keeps host key callbacks from waiting for an edit session.
-    // SAFETY: context and edit session are live, and the client ID came from TSF Activate.
-    let edit_status =
-        unsafe { context.RequestEditSession(client_id, &session, TF_ES_ASYNC | TF_ES_READWRITE)? };
-    if edit_status.0 < 0 {
-        Err(Error::from(edit_status))
-    } else {
-        Ok(())
-    }
-}
-
-fn schedule_engine_reply(
-    context: Option<&ITfContext>,
-    client_id: u32,
-    data: &Rc<RefCell<CompositionData>>,
-    reply: EngineReply,
-) -> bool {
-    let Some(context) = context else {
-        return false;
-    };
-    let edit = if let Some(commit) = reply.commit {
-        CompositionEdit::Commit(commit)
-    } else {
-        match reply.preedit {
-            Preedit::Keep => return true,
-            Preedit::Show(text) => CompositionEdit::Show(text),
-            Preedit::Hide => CompositionEdit::Cancel,
-        }
-    };
-    queue_composition_edit(context, client_id, data, edit).is_ok()
-}
-
-#[derive(Default)]
 struct Activation {
+    broker_window: Option<crate::broker_window::BrokerWindow>,
     thread_manager: Option<ITfThreadMgr>,
     keystroke_manager: Option<ITfKeystrokeMgr>,
     lang_bar_manager: Option<ITfLangBarItemMgr>,
     lang_bar_item: Option<ITfLangBarItemButton>,
+    context_source: Option<ITfSource>,
+    context_sink: Option<ITfThreadMgrEventSink>,
+    context_cookie: Option<u32>,
     client_id: u32,
 }
 
@@ -751,40 +605,51 @@ struct TextService {
     activation: Mutex<Activation>,
     mode: Arc<ModeController>,
     client_id: AtomicU32,
-    composition: Rc<RefCell<CompositionData>>,
+    composition: CompositionController,
 }
 
 impl TextService {
     #[allow(clippy::arc_with_non_send_sync)]
     fn new() -> Self {
         LIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
+        let composition = CompositionController::new();
         Self {
             activation: Mutex::new(Activation::default()),
-            mode: Arc::new(ModeController::new()),
+            mode: Arc::new(ModeController::new(composition.clone())),
             client_id: AtomicU32::new(0),
-            composition: Rc::new(RefCell::new(CompositionData::default())),
+            composition,
         }
     }
 }
 
 impl Drop for TextService {
     fn drop(&mut self) {
+        // A host can release the service without a completed Deactivate. Pending
+        // sessions may retain their controller, so invalidate their tickets now.
+        self.composition.reset(0);
+        self.composition.keys.stop_broker();
         LIVE_OBJECTS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 impl ITfTextInputProcessor_Impl for TextService_Impl {
     fn Activate(&self, manager: Ref<ITfThreadMgr>, client_id: u32) -> Result<()> {
+        registration_trace("Activate: enter");
+        if self.client_id.load(Ordering::Acquire) != 0 {
+            return Err(Error::from(E_FAIL));
+        }
         let manager = manager.as_ref().ok_or_else(|| Error::from(E_POINTER))?;
         let keystrokes: ITfKeystrokeMgr = manager.cast()?;
+        registration_trace("Activate: keystrokes ready");
         let sink: ITfKeyEventSink = self.to_interface();
         let mut advised = false;
         let mut preserved = false;
-        let mut added = false;
+        let mut added_item = None;
         let setup = (|| {
             // SAFETY: TSF owns the manager and callback contract.
             unsafe { keystrokes.AdviseKeyEventSink(client_id, &sink, true)? };
             advised = true;
+            registration_trace("Activate: key sink advised");
 
             let key = TF_PRESERVEDKEY {
                 uVKey: 0x20,
@@ -796,6 +661,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
                 keystrokes.PreserveKey(client_id, &GUID_PRESERVED_TOGGLE, &key, &description)?
             };
             preserved = true;
+            registration_trace("Activate: preserved key ready");
 
             let manager_compartments: ITfCompartmentMgr = manager.cast()?;
             let compartments = Compartments {
@@ -807,28 +673,59 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
                         .GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION)?
                 },
             };
-            if let Some((identity, path)) = app_mode_path() {
+            if std::env::var_os("WUFAN_TSF_SMOKE_CHINESE").is_some() {
+                self.mode.chinese.store(true, Ordering::Release);
+            } else if let Some((identity, path)) = app_mode_path() {
                 self.mode.start_persistence(identity, path)?;
             }
             self.mode.attach_compartments(client_id, compartments)?;
+            registration_trace("Activate: compartments attached");
 
             let lang_bar_manager: ITfLangBarItemMgr = manager.cast()?;
             let lang_bar_item: ITfLangBarItemButton =
                 ModeButton::new(Arc::clone(&self.mode)).into();
             unsafe { lang_bar_manager.AddItem(&lang_bar_item)? };
-            added = true;
-            Ok((lang_bar_manager, lang_bar_item))
+            added_item = Some((lang_bar_manager.clone(), lang_bar_item.clone()));
+            registration_trace("Activate: language bar ready");
+            let context_source: ITfSource = manager.cast()?;
+            let context_sink = self.composition.context_sink(client_id);
+            let context_cookie =
+                unsafe { context_source.AdviseSink(&ITfThreadMgrEventSink::IID, &context_sink)? };
+            let backend_setup = (|| {
+                self.composition.keys.start_broker()?;
+                crate::broker_window::BrokerWindow::new(self.composition.clone(), client_id)
+            })();
+            let broker_window = match backend_setup {
+                Ok(window) => window,
+                Err(error) => {
+                    registration_trace(&format!("Activate setup failed: {:?}", error.code()));
+                    self.composition.keys.stop_broker();
+                    let _ = unsafe { context_source.UnadviseSink(context_cookie) };
+                    return Err(error);
+                }
+            };
+            Ok((
+                lang_bar_manager,
+                lang_bar_item,
+                context_source,
+                context_sink,
+                context_cookie,
+                broker_window,
+            ))
         })();
 
-        let (lang_bar_manager, lang_bar_item) = match setup {
+        let (
+            lang_bar_manager,
+            lang_bar_item,
+            context_source,
+            context_sink,
+            context_cookie,
+            broker_window,
+        ) = match setup {
             Ok(value) => value,
             Err(error) => {
-                if added {
-                    if let Ok(manager) = manager.cast::<ITfLangBarItemMgr>() {
-                        let item: ITfLangBarItemButton =
-                            ModeButton::new(Arc::clone(&self.mode)).into();
-                        let _ = unsafe { manager.RemoveItem(&item) };
-                    }
+                if let Some((manager, item)) = added_item {
+                    let _ = unsafe { manager.RemoveItem(&item) };
                 }
                 if preserved {
                     let key = TF_PRESERVEDKEY {
@@ -846,6 +743,11 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             }
         };
 
+        if let Ok(document) = unsafe { manager.GetFocus() } {
+            if let Ok(context) = unsafe { document.GetTop() } {
+                self.composition.bind_context(Some(&context), client_id);
+            }
+        }
         let mut state = self
             .activation
             .lock()
@@ -854,8 +756,13 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         state.keystroke_manager = Some(keystrokes);
         state.lang_bar_manager = Some(lang_bar_manager);
         state.lang_bar_item = Some(lang_bar_item);
+        state.context_source = Some(context_source);
+        state.context_sink = Some(context_sink);
+        state.context_cookie = Some(context_cookie);
         state.client_id = client_id;
+        state.broker_window = Some(broker_window);
         self.client_id.store(client_id, Ordering::Release);
+        registration_trace("Activate: success");
         Ok(())
     }
 
@@ -866,9 +773,18 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             .map_err(|_| Error::from(E_NOINTERFACE))?;
         let activation = std::mem::take(&mut *state);
         drop(state);
+        self.composition.reset(activation.client_id);
+        self.composition.keys.stop_broker();
         self.client_id.store(0, Ordering::Release);
 
         let mut first_error = None;
+        if let (Some(source), Some(cookie)) =
+            (&activation.context_source, activation.context_cookie)
+        {
+            if let Err(error) = unsafe { source.UnadviseSink(cookie) } {
+                first_error = Some(error);
+            }
+        }
         if let (Some(manager), Some(item)) =
             (&activation.lang_bar_manager, &activation.lang_bar_item)
         {
@@ -903,7 +819,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             if foreground.as_bool() {
                 self.mode.apply_compartment_mode(self.mode.is_chinese())?;
             } else {
-                let _ = crate::key_adapter::reset_pinyin();
+                self.composition
+                    .reset(self.client_id.load(Ordering::Acquire));
             }
             Ok(())
         }));
@@ -914,15 +831,27 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     }
     fn OnTestKeyDown(
         &self,
-        _context: Ref<ITfContext>,
+        context: Ref<ITfContext>,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
-        Ok(crate::key_adapter::test_key_down(
-            wparam,
-            lparam,
-            self.mode.is_chinese(),
-        ))
+        let handled = catch_unwind(AssertUnwindSafe(|| {
+            if !self
+                .composition
+                .bind_context(context.as_ref(), self.client_id.load(Ordering::Acquire))
+            {
+                return BOOL(0);
+            }
+            if !self.mode.is_chinese() {
+                self.composition
+                    .reset(self.client_id.load(Ordering::Acquire));
+            }
+            self.composition
+                .keys
+                .test_key_down(wparam, lparam, self.mode.is_chinese())
+        }))
+        .unwrap_or(BOOL(0));
+        Ok(handled)
     }
     fn OnTestKeyUp(
         &self,
@@ -930,39 +859,22 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
-        Ok(crate::key_adapter::test_key_up(wparam, lparam))
+        Ok(self.composition.keys.test_key_up(wparam, lparam))
     }
     fn OnKeyDown(&self, context: Ref<ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
         let handled = catch_unwind(AssertUnwindSafe(|| {
+            let client_id = self.client_id.load(Ordering::Acquire);
+            if !self.composition.bind_context(context.as_ref(), client_id) {
+                return BOOL(0);
+            }
             let chinese_mode = self.mode.is_chinese();
             if !chinese_mode {
-                if let Some(reply) = crate::key_adapter::reset_pinyin() {
-                    let _ = schedule_engine_reply(
-                        context.as_ref(),
-                        self.client_id.load(Ordering::Acquire),
-                        &self.composition,
-                        reply,
-                    );
-                }
+                self.composition.reset(client_id);
             }
-            let outcome = crate::key_adapter::key_down(wparam, lparam, chinese_mode);
-            if let Some(reply) = outcome.engine_reply {
-                if !schedule_engine_reply(
-                    context.as_ref(),
-                    self.client_id.load(Ordering::Acquire),
-                    &self.composition,
-                    reply,
-                ) {
-                    if let Some(reset) = crate::key_adapter::reset_pinyin() {
-                        let _ = schedule_engine_reply(
-                            context.as_ref(),
-                            self.client_id.load(Ordering::Acquire),
-                            &self.composition,
-                            reset,
-                        );
-                    }
-                    return BOOL(0);
-                }
+            let outcome = self.composition.keys.key_down(wparam, lparam, chinese_mode);
+            if outcome.reset {
+                self.composition.reset_transport(client_id);
+                return BOOL(0);
             }
             outcome.handled
         }))
@@ -970,7 +882,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         Ok(handled)
     }
     fn OnKeyUp(&self, _context: Ref<ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
-        Ok(crate::key_adapter::key_up(wparam, lparam))
+        Ok(self.composition.keys.key_up(wparam, lparam))
     }
     fn OnPreservedKey(&self, _context: Ref<ITfContext>, guid: *const GUID) -> Result<BOOL> {
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -979,16 +891,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             }
             if unsafe { *guid } == GUID_PRESERVED_TOGGLE {
                 self.mode.toggle()?;
-                if let Some(reply) = crate::key_adapter::reset_pinyin() {
-                    if let Some(context) = _context.as_ref() {
-                        let _ = schedule_engine_reply(
-                            Some(context),
-                            self.client_id.load(Ordering::Acquire),
-                            &self.composition,
-                            reply,
-                        );
-                    }
-                }
+                self.composition
+                    .reset(self.client_id.load(Ordering::Acquire));
                 Ok(BOOL(1))
             } else {
                 Ok(BOOL(0))
@@ -1043,7 +947,21 @@ fn set_registry_value(key: HKEY, name: &str, value: &str) -> Result<()> {
     unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), None, REG_SZ, Some(bytes)) }.ok()
 }
 
-fn dll_path() -> Result<String> {
+pub(super) fn pin_for_worker() -> Result<()> {
+    let mut module = HMODULE::default();
+    // IPC shutdown is nonblocking. Pin code while detached workers unwind;
+    // the Windows loader releases the image when the host process exits.
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                | windows::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_PIN,
+            PCWSTR(DllGetClassObject as *const () as *const u16),
+            &mut module,
+        )
+    }
+}
+
+pub(super) fn dll_path() -> Result<String> {
     registration_trace("dll_path: begin");
     let mut module = HMODULE::default();
     // SAFETY: the address belongs to this module; the flag asks for its handle without changing
@@ -1140,14 +1058,14 @@ fn register_tsf() -> Result<()> {
         };
         registration_trace("register_tsf: services created");
         unsafe {
-            profiles.Register(&CLSID_WUFAN)?;
-            registration_trace("register_tsf: profile registered");
-            let label: Vec<u16> = "Wufan TSF Probe".encode_utf16().collect();
+            let profile_manager: windows::Win32::UI::TextServices::ITfInputProcessorProfileMgr =
+                profiles.cast()?;
+            let label: Vec<u16> = "Wufan 技术内测".encode_utf16().collect();
             // The icon path is optional in TSF, but windows-rs's slice wrapper cannot pass a
             // null pointer: an empty slice still has a non-null dangling pointer. Use the raw
             // vtable for this call so TSF receives the documented NULL icon path.
-            (Interface::vtable(&profiles).AddLanguageProfile)(
-                Interface::as_raw(&profiles),
+            (Interface::vtable(&profile_manager).RegisterProfile)(
+                Interface::as_raw(&profile_manager),
                 &CLSID_WUFAN,
                 0x0804,
                 &PROFILE_WUFAN,
@@ -1156,9 +1074,14 @@ fn register_tsf() -> Result<()> {
                 PCWSTR::null(),
                 0,
                 0,
+                windows::Win32::UI::Input::KeyboardAndMouse::HKL::default(),
+                0,
+                false.into(),
+                0,
             )
             .ok()?;
-            registration_trace("register_tsf: language added");
+            registration_trace("register_tsf: RegisterProfile succeeded");
+            profiles.EnableLanguageProfile(&CLSID_WUFAN, 0x0804, &PROFILE_WUFAN, true)?;
             categories.RegisterCategory(&CLSID_WUFAN, &GUID_TFCAT_TIP_KEYBOARD, &CLSID_WUFAN)?;
             registration_trace("register_tsf: category registered");
         }

@@ -1,0 +1,12 @@
+[package]
+name = "ime-rime-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ime-rime-sys = { path = "../rime-sys" }
+
+[target.'cfg(windows)'.dependencies]
+sha2 = "=0.10.9"

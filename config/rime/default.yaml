@@ -1,0 +1,8 @@
+config_version: '1.0'
+schema_list:
+  - schema: wufan_pinyin
+menu:
+  page_size: 9
+switcher:
+  caption: Wufan
+  hotkeys: []

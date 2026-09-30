@@ -4,10 +4,15 @@ members = [
     "crates/protocol",
     "crates/runtime-core",
     "crates/pinyin-engine",
+    "crates/rime-sys",
+    "crates/rime-adapter",
+    "crates/broker",
+    "crates/broker-transport",
     "crates/test-harness",
     "crates/xtask",
     "crates/windows-tsf",
 ]
+exclude = ["tools/rime-bindgen"]
 
 [workspace.package]
 version = "0.1.0"

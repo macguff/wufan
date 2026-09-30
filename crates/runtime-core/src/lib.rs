@@ -2,6 +2,9 @@
 
 //! Deterministic, platform-independent runtime state machine.
 
+pub mod host_commit;
+pub mod input_lifecycle;
+
 use ime_protocol::{
     BrokerGeneration, ClientInstanceId, CommitId, EffectId, Epoch, HostRevision, MessageIdentity,
     RequestSeq, SessionId,
@@ -1813,8 +1816,8 @@ fn reduce_inner(mut state: RuntimeState, event: Event) -> TransitionResult {
                     if let Some(index) = state.commits.iter().position(|entry| entry.is_some_and(|entry| {
                         entry.identity == pending.identity && entry.commit_id == pending.commit_id
                     })) {
-                        let (status, reply) = match (outcome, host_revision) {
-                            (EffectOutcome::Succeeded, Some(host_revision)) => (
+                        let (status, reply) = match host_commit::terminal_status(outcome, host_revision) {
+                            CommitStatus::Applied { host_revision } => (
                                 CommitStatus::Applied { host_revision },
                                 Some(Effect::SendCommitApplied {
                                     effect_id: state.allocate_effect(),
@@ -1822,7 +1825,7 @@ fn reduce_inner(mut state: RuntimeState, event: Event) -> TransitionResult {
                                     host_revision,
                                 }),
                             ),
-                            (EffectOutcome::Rejected, _) => (
+                            CommitStatus::Rejected => (
                                 CommitStatus::Rejected,
                                 Some(Effect::SendCommitRejected {
                                     effect_id: state.allocate_effect(),

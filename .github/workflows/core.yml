@@ -16,6 +16,15 @@ jobs:
           toolchain: 1.91.1
       - run: cargo build --locked --workspace --release --target x86_64-pc-windows-msvc
       - run: cargo test --locked --workspace --target x86_64-pc-windows-msvc
+      - name: Compile shared TSF acceptance scenarios for both text stores
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File ./scripts/tsf_input_smoke.ps1 -SkipBuild -CompileOnly -HostKind Wpf
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File ./scripts/tsf_input_smoke.ps1 -SkipBuild -CompileOnly -HostKind WinForms
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check isolated acceptance fault feature
+        run: cargo clippy --locked -p ime-broker --features fault-injection --all-targets -- -D warnings
       - name: Exercise TSF registration lifecycle (G1)
         shell: pwsh
         env:

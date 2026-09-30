@@ -6,10 +6,19 @@ fn main() -> ExitCode {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut args = env::args().skip(1);
     let Some(task) = args.next() else {
-        eprintln!("usage: cargo xtask -- <check-boundaries|fmt|clippy|test|test-nextest|miri|ci>");
+        eprintln!("usage: cargo xtask -- <bindgen-rime|check-boundaries|fmt|clippy|test|test-nextest|miri|ci>");
         return ExitCode::from(2);
     };
     let result = match task.as_str() {
+        "bindgen-rime" => cargo(
+            &root,
+            &[
+                "run",
+                "--locked",
+                "--manifest-path",
+                "tools/rime-bindgen/Cargo.toml",
+            ],
+        ),
         "check-boundaries" => check_boundaries(&root),
         "fmt" => cargo(&root, &["fmt", "--all", "--", "--check"]),
         "clippy" => cargo(
@@ -92,6 +101,30 @@ fn check_boundaries(root: &PathBuf) -> Result<(), String> {
                 "runtime-core dependency tree contains forbidden `{forbidden}`"
             ));
         }
+    }
+    for (package, forbidden) in [
+        ("ime-protocol", "windows"),
+        ("ime-protocol", "tokio"),
+        ("ime-protocol", "rime-sys"),
+        ("ime-windows-tsf", "tokio"),
+        ("ime-windows-tsf", "rime-sys"),
+    ] {
+        let output = Command::new("cargo")
+            .args(["tree", "--locked", "-p", package])
+            .current_dir(root)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(format!("cargo tree failed for {package}"));
+        }
+        if String::from_utf8_lossy(&output.stdout).contains(forbidden) {
+            return Err(format!("{package} depends on forbidden {forbidden}"));
+        }
+    }
+    let broker_manifest = std::fs::read_to_string(root.join("crates/broker/Cargo.toml"))
+        .map_err(|e| e.to_string())?;
+    if broker_manifest.contains("rime-sys") {
+        return Err("Broker must depend only on the safe rime-adapter".into());
     }
     for crate_path in ["crates/protocol/src", "crates/runtime-core/src"] {
         let path = root.join(crate_path);

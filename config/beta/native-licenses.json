@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "reviewComplete": false,
+  "components": [
+    { "name": "Wufan", "source": "Cargo.toml workspace MIT OR Apache-2.0", "status": "Project license texts and attribution still need to be supplied" },
+    { "name": "librime", "source": "rime/librime 1.17.0 / 33e7814", "archiveSha256": "7478c7caa4ff6b37de86daba1f7ce4a994a4f5ba24872a820fb2b3a9b01fed15", "status": "Vendored upstream LICENSE included; binary dependency inventory still needs review" },
+    { "name": "librime native dependencies and OpenCC data", "source": "rime-deps-33e7814-Windows-msvc-x64.7z", "archiveSha256": "9ef5608d8a54ff52bbad7a9b4128de42b232f8e3dd1f5fd3bff42a0b1bacd7e8", "status": "glog, leveldb, yaml-cpp, marisa and OpenCC upstream texts included; Boost and plugin/transitive notices remain to review" },
+    { "name": "glog", "source": "google/glog@7b134a5c82c0c0b5698bb6bf7a835b230c5638e4", "text": "glog-COPYING", "status": "Upstream text included" },
+    { "name": "leveldb", "source": "google/leveldb@99b3c03b3284f5886f9ef9a4ef703d57373e61be", "text": "leveldb-LICENSE", "status": "Upstream text included; transitive notices still to review" },
+    { "name": "yaml-cpp", "source": "jbeder/yaml-cpp@2f86d13775d119edbb69af52e5f566fd65c6953b", "text": "yaml-cpp-LICENSE", "status": "Upstream text included" },
+    { "name": "marisa", "source": "s-yata/marisa-trie@3e87d53b78e15f2f43783d5e376561a8c9722051", "text": "marisa-COPYING.md", "status": "Upstream text included; review dual-license option and attribution" },
+    { "name": "OpenCC", "source": "BYVoid/OpenCC@556ed22496d650bd0b13b6c163be9814637970ae", "text": "opencc-LICENSE", "status": "Upstream text included; data and third-party notices still to review" },
+    { "name": "Boost", "source": "librime@33e7814 .github/workflows/windows-build.yml specifies 1.89.0", "status": "Obtain Boost license and reconcile binary build provenance" },
+    { "name": "librime-lua", "source": "hchunhui/librime-lua@ec52e48 (pinned binary version-info.txt)", "status": "Obtain plugin, Lua and other bundled dependency notices" },
+    { "name": "librime-octagram", "source": "lotem/librime-octagram@dfcc151 (pinned binary version-info.txt)", "status": "Obtain plugin and bundled dependency notices" },
+    { "name": "librime-predict", "source": "rime/librime-predict@920bd41 (pinned binary version-info.txt)", "status": "Obtain plugin and bundled dependency notices" },
+    { "name": "luna_pinyin dictionary", "source": "rime/rime-luna-pinyin@56b934b099dfbeab842320f13aa8b461a6ab3e42", "sha256": "75bcf6eb3ff62b129882ed89cc22b2d80a5347aa72bcfa2ccc839bac298e7314", "text": "luna-pinyin-LICENSE", "status": "Upstream LGPLv3 text included; GPLv3 incorporated text, source and data attribution requirements still to review" },
+    { "name": "essay data", "source": "rime/rime-essay@054920de4f54c9e5994276a96a4fc2a35cb51aa3", "sha256": "3e8512ebaa6657e35961b1f5762060717c647e3bf471d5e3b86e783b4e934ffb", "text": "essay-LICENSE", "status": "Upstream LGPLv3 text included; GPLv3 incorporated text, source and data attribution requirements still to review" },
+    { "name": "Microsoft Visual C++ runtime", "source": "User-installed x64 Visual C++ Redistributable", "status": "Not bundled; document prerequisite and verify on a clean Windows machine" }
+  ]
+}
